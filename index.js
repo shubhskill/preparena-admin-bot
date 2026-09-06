@@ -2,32 +2,23 @@ const TelegramBot = require("node-telegram-bot-api");
 const { createClient } = require("@supabase/supabase-js");
 const crypto = require("crypto");
 
+/* =========================================================
+   ENV
+========================================================= */
+
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const OWNER_PASSWORD = process.env.OWNER_PASSWORD;
 
+if (!BOT_TOKEN) throw new Error("BOT_TOKEN is missing");
+if (!SUPABASE_URL) throw new Error("SUPABASE_URL is missing");
+if (!SUPABASE_SECRET_KEY) throw new Error("SUPABASE_SECRET_KEY is missing");
+if (!OWNER_PASSWORD) throw new Error("OWNER_PASSWORD is missing");
+
 const OWNER_TELEGRAM_ID = 8256722518;
 
-if (!BOT_TOKEN) {
-  throw new Error("BOT_TOKEN is not configured");
-}
-
-if (!SUPABASE_URL) {
-  throw new Error("SUPABASE_URL is not configured");
-}
-
-if (!SUPABASE_SECRET_KEY) {
-  throw new Error("SUPABASE_SECRET_KEY is not configured");
-}
-
-if (!OWNER_PASSWORD) {
-  throw new Error("OWNER_PASSWORD is not configured");
-}
-
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: true
-});
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 const supabase = createClient(
   SUPABASE_URL,
@@ -41,763 +32,375 @@ const supabase = createClient(
 );
 
 /* =========================================================
-   SESSION MANAGEMENT
+   SESSION
 ========================================================= */
 
 const sessions = new Map();
 
-const CALLBACK_PREFIX = "cb_";
-
-function sessionKey(chatId) {
-  return String(chatId);
-}
-
 function getSession(chatId) {
-  const key = sessionKey(chatId);
-
-  if (!sessions.has(key)) {
-    sessions.set(key, {
-      state: "idle",
-      data: {},
-      authenticated: false,
-      authAction: null
-    });
-  }
-
-  return sessions.get(key);
+  return sessions.get(chatId);
 }
 
-function resetSession(chatId) {
-  sessions.set(sessionKey(chatId), {
-    state: "idle",
-    data: {},
-    authenticated: false,
-    authAction: null
+function setSession(chatId, data) {
+  sessions.set(chatId, {
+    ...(sessions.get(chatId) || {}),
+    ...data
   });
 }
 
 function clearSession(chatId) {
-  sessions.delete(sessionKey(chatId));
+  sessions.delete(chatId);
 }
 
 /* =========================================================
    TELEGRAM HELPERS
 ========================================================= */
 
-async function safeSend(chatId, text, options = {}) {
+const PREFIX = "pa:";
+
+async function send(chatId, text, options = {}) {
+  return bot.sendMessage(chatId, text, {
+    parse_mode: "HTML",
+    ...options
+  });
+}
+
+async function editMessage(chatId, messageId, text, options = {}) {
   try {
-    return await bot.sendMessage(chatId, text, options);
-  } catch (error) {
-    console.error("sendMessage error:", error.message);
-    return null;
+    return await bot.editMessageText(text, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: "HTML",
+      ...options
+    });
+  } catch {
+    return send(chatId, text, options);
   }
 }
 
-async function answerCallback(query, text = "") {
-  try {
-    if (text) {
-      await bot.answerCallbackQuery(query.id, {
-        text
-      });
-    } else {
-      await bot.answerCallbackQuery(query.id);
-    }
-  } catch (_) {}
+function mainKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "📝 Tests", callback_data: `${PREFIX}tests` },
+        { text: "📚 Subjects", callback_data: `${PREFIX}subjects` }
+      ],
+      [
+        { text: "👥 Admins", callback_data: `${PREFIX}admins` },
+        { text: "❓ Help", callback_data: `${PREFIX}help` }
+      ]
+    ]
+  };
 }
 
-function escapeMarkdown(text) {
-  return String(text ?? "").replace(
-    /([_*[\]`])/g,
-    "\\$1"
-  );
-}
-
-function normalizeName(text) {
-  return String(text || "")
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-function isDraft(test) {
-  return test && test.status === "draft";
-}
-
-function statusEmoji(status) {
-  if (status === "draft") return "🟡";
-  if (status === "published") return "🟢";
-  return "🔴";
-}
-
-function makeCode() {
-  return `PA${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+function backKeyboard(callback = "panel") {
+  return {
+    inline_keyboard: [
+      [{ text: "⬅️ Back", callback_data: `${PREFIX}${callback}` }]
+    ]
+  };
 }
 
 /* =========================================================
-   PASSWORD HASHING
+   PASSWORD
 ========================================================= */
 
 function hashPassword(password) {
-  const salt = crypto.randomBytes(16);
+  const salt = crypto.randomBytes(16).toString("hex");
 
-  const derivedKey = crypto.scryptSync(
-    String(password),
-    salt,
-    64
-  );
+  const hash = crypto
+    .scryptSync(password, salt, 64)
+    .toString("hex");
 
-  return [
-    "scrypt",
-    salt.toString("hex"),
-    derivedKey.toString("hex")
-  ].join(":");
+  return `${salt}:${hash}`;
 }
 
 function verifyPassword(password, storedHash) {
   try {
-    const parts = String(storedHash || "").split(":");
+    const parts = String(storedHash).split(":");
 
-    const kind = parts[0];
-    const saltHex = parts[1];
-    const hashHex = parts[2];
+    if (parts.length !== 2) return false;
 
-    if (
-      kind !== "scrypt" ||
-      !saltHex ||
-      !hashHex
-    ) {
-      return false;
-    }
+    const salt = parts[0];
+    const stored = Buffer.from(parts[1], "hex");
 
-    const actual = crypto.scryptSync(
-      String(password),
-      Buffer.from(saltHex, "hex"),
-      64
-    );
-
-    const expected = Buffer.from(
-      hashHex,
-      "hex"
-    );
+    const derived = crypto.scryptSync(password, salt, 64);
 
     return (
-      actual.length === expected.length &&
-      crypto.timingSafeEqual(actual, expected)
+      stored.length === derived.length &&
+      crypto.timingSafeEqual(stored, derived)
     );
-  } catch (_) {
+  } catch {
     return false;
   }
 }
 
 /* =========================================================
-   OWNER ACCOUNT
+   OWNER BOOTSTRAP
 ========================================================= */
 
 async function ensureOwnerAccount() {
-  const {
-    data,
-    error
-  } = await supabase
+  const { data, error } = await supabase
     .from("telegram_admins")
-    .select(
-      "telegram_user_id, role, is_active"
-    )
-    .eq(
-      "telegram_user_id",
-      OWNER_TELEGRAM_ID
-    )
+    .select("*")
+    .eq("telegram_user_id", OWNER_TELEGRAM_ID)
     .maybeSingle();
 
   if (error) {
-    throw error;
+    console.error("Owner lookup error:", error);
+    return;
   }
 
   if (!data) {
-    const {
-      error: insertError
-    } = await supabase
+    const { error: insertError } = await supabase
       .from("telegram_admins")
       .insert({
-        telegram_user_id:
-          OWNER_TELEGRAM_ID,
+        telegram_user_id: OWNER_TELEGRAM_ID,
         role: "owner",
-        password_hash:
-          hashPassword(OWNER_PASSWORD),
+        password_hash: hashPassword(OWNER_PASSWORD),
         is_active: true
       });
 
     if (insertError) {
-      throw insertError;
+      console.error("Owner insert error:", insertError);
+    } else {
+      console.log("Owner account created.");
     }
-
-    console.log(
-      "Owner account created."
-    );
 
     return;
   }
 
   if (
     data.role !== "owner" ||
-    !data.is_active
+    data.is_active !== true
   ) {
-    const {
-      error: updateError
-    } = await supabase
+    const { error: updateError } = await supabase
       .from("telegram_admins")
       .update({
         role: "owner",
         is_active: true,
-        updated_at:
-          new Date().toISOString()
+        updated_at: new Date().toISOString()
       })
-      .eq(
-        "telegram_user_id",
-        OWNER_TELEGRAM_ID
-      );
+      .eq("telegram_user_id", OWNER_TELEGRAM_ID);
 
     if (updateError) {
-      throw updateError;
+      console.error("Owner update error:", updateError);
     }
   }
 }
 
 /* =========================================================
-   ADMIN AUTH
+   AUTH
 ========================================================= */
 
 async function getAdmin(telegramUserId) {
-  const {
-    data,
-    error
-  } = await supabase
+  const { data, error } = await supabase
     .from("telegram_admins")
-    .select(
-      "telegram_user_id, role, password_hash, is_active"
-    )
-    .eq(
-      "telegram_user_id",
-      telegramUserId
-    )
+    .select("*")
+    .eq("telegram_user_id", telegramUserId)
+    .eq("is_active", true)
     .maybeSingle();
 
   if (error) {
-    console.error(
-      "getAdmin:",
-      error.message
-    );
-
+    console.error("Admin lookup:", error);
     return null;
   }
 
   return data || null;
 }
 
-async function beginAuth(
-  chatId,
-  action,
-  title = "🔐 Admin authentication"
-) {
-  const session = getSession(chatId);
+async function requireAuth(msg) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
 
-  session.state = "await_password";
-  session.data = {};
-  session.authenticated = false;
-  session.authAction = action;
+  const admin = await getAdmin(userId);
 
-  await safeSend(
-    chatId,
-    `${title}\n\nEnter your admin password:`
-  );
-}
-
-async function showAdminGate(chatId) {
-  resetSession(chatId);
-
-  await safeSend(
-    chatId,
-    "🛡️ *PrepArena Admin Bot*\n\nAuthentication is required for every admin action.",
-    {
-      parse_mode: "Markdown"
-    }
-  );
-
-  await beginAuth(
-    chatId,
-    "panel"
-  );
-}
-
-/* =========================================================
-   AUTHENTICATED ACTION ROUTER
-========================================================= */
-
-async function runAuthenticatedAction(
-  chatId,
-  action
-) {
-  if (action === "panel") {
-    return sendAdminPanel(chatId);
-  }
-
-  if (action === "tests") {
-    return showTests(chatId);
-  }
-
-  if (action === "create_test") {
-    return startCreateTest(chatId);
-  }
-
-  if (action.startsWith("edit_test:")) {
-    return showEditTestMenu(
+  if (!admin) {
+    await send(
       chatId,
-      action.slice(10)
+      "⛔ <b>Access Denied</b>\n\nYou are not authorized to use the PrepArena Admin Bot."
     );
-  }
-
-  if (action.startsWith("subjects:")) {
-    return showTestSubjects(
-      chatId,
-      action.slice(9)
-    );
-  }
-
-  if (action === "subs") {
-    return showSubjects(chatId);
-  }
-
-  if (action === "new_subject") {
-    return startNewSubject(chatId);
-  }
-
-  if (action.startsWith("edit_subject:")) {
-    return startEditSubject(
-      chatId,
-      action.slice(13)
-    );
-  }
-
-  if (action.startsWith("remove_subject:")) {
-    return removeSubject(
-      chatId,
-      action.slice(15)
-    );
-  }
-
-  if (action.startsWith("questions:")) {
-    return showQuestionMenu(
-      chatId,
-      action.slice(10)
-    );
-  }
-
-  if (action.startsWith("add_question:")) {
-    return startAddQuestion(
-      chatId,
-      action.slice(13)
-    );
-  }
-
-  if (action.startsWith("view_questions:")) {
-    return viewQuestions(
-      chatId,
-      action.slice(15),
-      0
-    );
-  }
-
-  if (action.startsWith("edit_question:")) {
-    return startEditQuestion(
-      chatId,
-      action.slice(14)
-    );
-  }
-
-  if (action.startsWith("delete_question:")) {
-    return confirmDeleteQuestion(
-      chatId,
-      action.slice(16)
-    );
-  }
-
-  if (action.startsWith("publish:")) {
-    return publishTest(
-      chatId,
-      action.slice(8)
-    );
-  }
-
-  if (action.startsWith("end:")) {
-    return endTest(
-      chatId,
-      action.slice(4)
-    );
-  }
-
-  if (action.startsWith("answer_key:")) {
-    return answerKeyPlaceholder(
-      chatId,
-      action.slice(11)
-    );
-  }
-
-  if (action.startsWith("results:")) {
-    return resultsPlaceholder(
-      chatId,
-      action.slice(8)
-    );
-  }
-
-  if (action === "admins") {
-    return showAdmins(chatId);
-  }
-
-  if (action === "add_admin") {
-    return startAddAdmin(chatId);
-  }
-
-  if (
-    action.startsWith(
-      "set_admin_password:"
-    )
-  ) {
-    return startSetAdminPassword(
-      chatId,
-      action.slice(19)
-    );
-  }
-
-  if (
-    action.startsWith(
-      "disable_admin:"
-    )
-  ) {
-    return disableAdmin(
-      chatId,
-      action.slice(14)
-    );
-  }
-
-  return sendAdminPanel(chatId);
-}
-
-/* =========================================================
-   ADMIN PANEL
-========================================================= */
-
-async function sendAdminPanel(chatId) {
-  const keyboard = {
-    inline_keyboard: [
-      [
-        {
-          text: "📝 Tests",
-          callback_data:
-            `${CALLBACK_PREFIX}tests`
-        },
-        {
-          text: "📚 Subjects",
-          callback_data:
-            `${CALLBACK_PREFIX}subs`
-        }
-      ],
-      [
-        {
-          text: "👥 Admins",
-          callback_data:
-            `${CALLBACK_PREFIX}admins`
-        }
-      ],
-      [
-        {
-          text: "❓ Help",
-          callback_data:
-            `${CALLBACK_PREFIX}help`
-        },
-        {
-          text: "🚪 Logout",
-          callback_data:
-            `${CALLBACK_PREFIX}logout`
-        }
-      ]
-    ]
-  };
-
-  await safeSend(
-    chatId,
-    "🏟️ *PrepArena Admin Panel*\n\nChoose an action:",
-    {
-      parse_mode: "Markdown",
-      reply_markup: keyboard
-    }
-  );
-}
-
-async function showHelp(chatId) {
-  await safeSend(
-    chatId,
-`📖 *Admin Help*
-
-• Tests → create/edit tests
-• Subjects → add, rename or deactivate subjects
-• Questions → add, view, edit or delete questions
-• Numerical questions do *not* ask for a correct answer while building the test.
-• Answer keys are entered after the test ends.
-• Publish locks test editing.
-• End marks a published test as ended.
-• Owner can add/manage admins.
-• Admin passwords are stored as hashes.
-
-Use /start anytime to authenticate again.`,
-    {
-      parse_mode: "Markdown"
-    }
-  );
-}
-
-/* =========================================================
-   TEST LIST
-========================================================= */
-
-async function showTests(chatId) {
-  const {
-    data,
-    error
-  } = await supabase
-    .from("tests")
-    .select(
-      "id,title,test_code,status,test_date,test_time,duration_minutes,total_questions,total_marks"
-    )
-    .order("created_at", {
-      ascending: false
-    })
-    .limit(30);
-
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
-  }
-
-  if (!data || !data.length) {
-    return safeSend(
-      chatId,
-      "📝 No tests yet.",
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: "➕ Create Test",
-                callback_data:
-                  `${CALLBACK_PREFIX}ct`
-              }
-            ],
-            [
-              {
-                text: "⬅️ Panel",
-                callback_data:
-                  `${CALLBACK_PREFIX}panel`
-              }
-            ]
-          ]
-        }
-      }
-    );
-  }
-
-  const rows = data.map(test => [
-    {
-      text:
-        `${statusEmoji(test.status)} ${test.title}`,
-      callback_data:
-        `${CALLBACK_PREFIX}et:${test.id}`
-    }
-  ]);
-
-  rows.push([
-    {
-      text: "➕ Create Test",
-      callback_data:
-        `${CALLBACK_PREFIX}ct`
-    }
-  ]);
-
-  rows.push([
-    {
-      text: "⬅️ Panel",
-      callback_data:
-        `${CALLBACK_PREFIX}panel`
-    }
-  ]);
-
-  await safeSend(
-    chatId,
-    "📝 *Tests*\n\nTap a test to manage it:",
-    {
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: rows
-      }
-    }
-  );
-}
-
-/* =========================================================
-   FETCH TEST
-========================================================= */
-
-async function fetchTest(testId) {
-  const {
-    data,
-    error
-  } = await supabase
-    .from("tests")
-    .select("*")
-    .eq("id", testId)
-    .maybeSingle();
-
-  if (error) {
-    console.error(
-      "fetchTest:",
-      error.message
-    );
-
     return null;
   }
 
-  return data;
+  return admin;
+}
+
+async function requireCallbackAuth(query) {
+  const userId = query.from.id;
+
+  const admin = await getAdmin(userId);
+
+  if (!admin) {
+    await bot.answerCallbackQuery(query.id, {
+      text: "Access denied",
+      show_alert: true
+    });
+    return null;
+  }
+
+  return admin;
 }
 
 /* =========================================================
-   TEST DETAIL
+   LOGIN
 ========================================================= */
 
-async function showTestDetail(
-  chatId,
-  testId
-) {
-  const test = await fetchTest(testId);
+async function startLogin(chatId, userId) {
+  const admin = await getAdmin(userId);
 
-  if (!test) {
-    return safeSend(
+  if (!admin) {
+    await send(
       chatId,
-      "❌ Test not found."
+      "⛔ <b>Access Denied</b>\n\nThis Telegram account is not registered as an admin."
     );
+    return;
   }
 
-  const {
-    data: links
-  } = await supabase
-    .from("test_subjects")
-    .select("subject_id")
-    .eq("test_id", testId);
+  setSession(chatId, {
+    loggedIn: false,
+    authUserId: userId,
+    state: "password"
+  });
 
-  let subjectText = "None";
+  await send(
+    chatId,
+    "🔐 <b>Admin Authentication</b>\n\nEnter your password:"
+  );
+}
 
-  if (links && links.length) {
-    const ids = links.map(
-      item => item.subject_id
-    );
+async function processPassword(msg) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const session = getSession(chatId);
 
-    const {
-      data: subjects
-    } = await supabase
-      .from("subjects")
-      .select("name")
-      .in("id", ids);
+  if (!session || session.state !== "password") return false;
 
-    subjectText =
-      (subjects || [])
-        .map(item => item.name)
-        .join(", ") || "None";
+  const admin = await getAdmin(userId);
+
+  if (!admin) {
+    clearSession(chatId);
+    await send(chatId, "⛔ Access denied.");
+    return true;
   }
 
-  const buttons = [
-    [
-      {
-        text: "✏️ Edit Test",
-        callback_data:
-          `${CALLBACK_PREFIX}etm:${testId}`
-      }
-    ],
-    [
-      {
-        text: "📚 Subjects",
-        callback_data:
-          `${CALLBACK_PREFIX}ts:${testId}`
-      }
-    ],
-    [
-      {
-        text: "❓ Questions",
-        callback_data:
-          `${CALLBACK_PREFIX}qm:${testId}`
-      }
-    ],
-    [
-      {
-        text: "🔑 Answer Key",
-        callback_data:
-          `${CALLBACK_PREFIX}ak:${testId}`
-      },
-      {
-        text: "📊 Results",
-        callback_data:
-          `${CALLBACK_PREFIX}rs:${testId}`
-      }
-    ]
-  ];
+  if (!verifyPassword(msg.text.trim(), admin.password_hash)) {
+    await send(
+      chatId,
+      "❌ Incorrect password.\n\nTry again or use /cancel."
+    );
+    return true;
+  }
 
-  if (test.status === "draft") {
+  setSession(chatId, {
+    loggedIn: true,
+    authUserId: userId,
+    adminRole: admin.role,
+    state: null
+  });
+
+  await send(
+    chatId,
+    "✅ <b>Authentication successful.</b>",
+    {
+      reply_markup: mainKeyboard()
+    }
+  );
+
+  return true;
+}
+
+/* =========================================================
+   PANEL
+========================================================= */
+
+async function showPanel(chatId) {
+  await send(
+    chatId,
+    "🛠️ <b>PrepArena Admin Panel</b>\n\nChoose an action:",
+    {
+      reply_markup: mainKeyboard()
+    }
+  );
+}
+
+/* =========================================================
+   HELP
+========================================================= */
+
+async function showHelp(chatId) {
+  await send(
+    chatId,
+    `❓ <b>PrepArena Admin Bot</b>
+
+<b>Tests</b>
+• Create tests
+• Edit draft tests
+• Manage subjects
+• Add questions
+• Edit questions
+• Delete questions
+• Publish / end tests
+
+<b>Question Types</b>
+• MCQ
+• Multiple Correct
+• Numerical
+
+<b>Important</b>
+Correct answers are NOT entered while creating questions.
+They will be added later through the Answer Key system.
+
+Use /cancel anytime to cancel the current operation.`,
+    {
+      reply_markup: backKeyboard()
+    }
+  );
+}
+
+/* =========================================================
+   TESTS
+========================================================= */
+
+async function showTests(chatId) {
+  const { data, error } = await supabase
+    .from("tests")
+    .select("*")
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error(error);
+    await send(chatId, "❌ Could not load tests.");
+    return;
+  }
+
+  const buttons = [];
+
+  for (const test of data || []) {
     buttons.push([
       {
-        text: "🚀 Publish",
-        callback_data:
-          `${CALLBACK_PREFIX}pub:${testId}`
-      }
-    ]);
-  }
-
-  if (test.status === "published") {
-    buttons.push([
-      {
-        text: "⛔ End Test",
-        callback_data:
-          `${CALLBACK_PREFIX}end:${testId}`
+        text: `${statusEmoji(test.status)} ${test.title}`,
+        callback_data: `${PREFIX}test:${test.id}`
       }
     ]);
   }
 
   buttons.push([
-    {
-      text: "⬅️ Tests",
-      callback_data:
-        `${CALLBACK_PREFIX}tests`
-    }
+    { text: "➕ Create Test", callback_data: `${PREFIX}create` }
   ]);
 
-  await safeSend(
+  buttons.push([
+    { text: "⬅️ Back", callback_data: `${PREFIX}panel` }
+  ]);
+
+  await send(
     chatId,
-`📝 *${escapeMarkdown(test.title)}*
-
-Code: ${test.test_code || "—"}
-Status: ${test.status}
-Date: ${test.test_date || "—"}
-Time: ${test.test_time || "—"}
-Duration: ${test.duration_minutes} min
-Questions: ${test.total_questions}
-Total marks: ${test.total_marks}
-Marks/question: ${test.marks_per_question}
-Negative marking: ${
-      test.negative_marking_enabled
-        ? `Yes (-${test.negative_marking_value})`
-        : "No"
-    }
-Subjects: ${escapeMarkdown(subjectText)}
-
-${escapeMarkdown(test.description || "")}`,
+    `📝 <b>Tests</b>\n\n${
+      data?.length
+        ? "Select a test:"
+        : "No tests created yet."
+    }`,
     {
-      parse_mode: "Markdown",
       reply_markup: {
         inline_keyboard: buttons
       }
@@ -805,187 +408,118 @@ ${escapeMarkdown(test.description || "")}`,
   );
 }
 
-/* =========================================================
-   CREATE TEST
-========================================================= */
-
-async function startCreateTest(chatId) {
-  const session = getSession(chatId);
-
-  session.state = "create_title";
-  session.data = {};
-  session.authenticated = true;
-
-  await safeSend(
-    chatId,
-    "➕ *Create Test*\n\nEnter test title:",
-    {
-      parse_mode: "Markdown"
-    }
-  );
+function statusEmoji(status) {
+  if (status === "published") return "🟢";
+  if (status === "ended") return "🔴";
+  return "🟡";
 }
 
-async function createTestFromSession(
-  chatId
-) {
-  const session = getSession(chatId);
-  const data = session.data;
-
-  const code =
-    data.testCode || makeCode();
-
-  const payload = {
-    title: data.title,
-    description:
-      data.description || null,
-    test_code: code,
-    status: "draft",
-    test_date:
-      data.testDate || null,
-    test_time:
-      data.testTime || null,
-    duration_minutes:
-      data.duration || 180,
-    total_questions: 0,
-    total_marks: 0,
-    marks_per_question:
-      data.marksPerQuestion || 4,
-    negative_marking_enabled:
-      data.negativeEnabled,
-    negative_marking_value:
-      data.negativeValue || 1,
-    instructions:
-      data.instructions || null
-  };
-
-  const {
-    data: test,
-    error
-  } = await supabase
+async function getTest(testId) {
+  const { data, error } = await supabase
     .from("tests")
-    .insert(payload)
-    .select()
-    .single();
+    .select("*")
+    .eq("id", testId)
+    .maybeSingle();
 
   if (error) {
-    return safeSend(
-      chatId,
-      `❌ Could not create test: ${error.message}`
-    );
+    console.error(error);
+    return null;
   }
 
-  resetSession(chatId);
-
-  const newSession =
-    getSession(chatId);
-
-  newSession.authenticated = true;
-
-  await safeSend(
-    chatId,
-    `✅ Test created!\n\nCode: ${test.test_code}`
-  );
-
-  await showTestDetail(
-    chatId,
-    test.id
-  );
+  return data;
 }
 
-/* =========================================================
-   EDIT TEST
-========================================================= */
-
-async function showEditTestMenu(
-  chatId,
-  testId
-) {
-  const test = await fetchTest(testId);
+async function showTestDetail(chatId, testId) {
+  const test = await getTest(testId);
 
   if (!test) {
-    return safeSend(
-      chatId,
-      "❌ Test not found."
-    );
+    await send(chatId, "❌ Test not found.");
+    return;
   }
 
-  if (!isDraft(test)) {
-    return safeSend(
-      chatId,
-      "🔒 Published/ended tests are locked."
-    );
+  const { data: testSubjects } = await supabase
+    .from("test_subjects")
+    .select("subject_id")
+    .eq("test_id", testId);
+
+  let subjectText = "None";
+
+  if (testSubjects?.length) {
+    const ids = testSubjects.map(x => x.subject_id);
+
+    const { data: subjects } = await supabase
+      .from("subjects")
+      .select("name")
+      .in("id", ids);
+
+    subjectText =
+      subjects?.map(s => s.name).join(", ") || "None";
   }
 
-  await safeSend(
+  await send(
     chatId,
-`✏️ *Edit Test*
+    `📝 <b>${escapeHtml(test.title)}</b>
 
-${escapeMarkdown(test.title)}
-
-Choose a field:`,
+<b>Status:</b> ${test.status}
+<b>Description:</b> ${escapeHtml(test.description || "Not set")}
+<b>Date:</b> ${test.test_date || "Not set"}
+<b>Time:</b> ${test.test_time || "Not set"}
+<b>Duration:</b> ${test.duration_minutes} min
+<b>Marks/Question:</b> ${test.marks_per_question}
+<b>Negative:</b> ${
+      test.negative_marking_enabled
+        ? `Yes (-${test.negative_marking_value})`
+        : "No"
+    }
+<b>Questions:</b> ${test.total_questions}
+<b>Total Marks:</b> ${test.total_marks}
+<b>Subjects:</b> ${escapeHtml(subjectText)}
+<b>Instructions:</b> ${escapeHtml(test.instructions || "Not set")}`,
     {
-      parse_mode: "Markdown",
       reply_markup: {
         inline_keyboard: [
           [
             {
-              text: "Title",
-              callback_data:
-                `${CALLBACK_PREFIX}field:title:${testId}`
+              text: "✏️ Edit Test",
+              callback_data: `${PREFIX}edit:${testId}`
             }
           ],
           [
             {
-              text: "Description",
-              callback_data:
-                `${CALLBACK_PREFIX}field:desc:${testId}`
+              text: "❓ Questions",
+              callback_data: `${PREFIX}questions:${testId}`
             }
           ],
           [
             {
-              text: "Date",
-              callback_data:
-                `${CALLBACK_PREFIX}field:date:${testId}`
-            },
-            {
-              text: "Time",
-              callback_data:
-                `${CALLBACK_PREFIX}field:time:${testId}`
+              text: "📚 Subjects",
+              callback_data: `${PREFIX}tsub:${testId}`
             }
           ],
-          [
-            {
-              text: "Duration",
-              callback_data:
-                `${CALLBACK_PREFIX}field:duration:${testId}`
-            }
-          ],
-          [
-            {
-              text: "Marks/Question",
-              callback_data:
-                `${CALLBACK_PREFIX}field:marks:${testId}`
-            }
-          ],
-          [
-            {
-              text: "Negative Marking",
-              callback_data:
-                `${CALLBACK_PREFIX}field:negative:${testId}`
-            }
-          ],
-          [
-            {
-              text: "Instructions",
-              callback_data:
-                `${CALLBACK_PREFIX}field:instructions:${testId}`
-            }
-          ],
+          ...(test.status === "draft"
+            ? [
+                [
+                  {
+                    text: "🚀 Publish Test",
+                    callback_data: `${PREFIX}publish:${testId}`
+                  }
+                ]
+              ]
+            : []),
+          ...(test.status === "published"
+            ? [
+                [
+                  {
+                    text: "🔴 End Test",
+                    callback_data: `${PREFIX}end:${testId}`
+                  }
+                ]
+              ]
+            : []),
           [
             {
               text: "⬅️ Back",
-              callback_data:
-                `${CALLBACK_PREFIX}et:${testId}`
+              callback_data: `${PREFIX}tests`
             }
           ]
         ]
@@ -994,173 +528,727 @@ Choose a field:`,
   );
 }
 
-async function saveTestField(
-  chatId,
-  testId,
-  field,
-  value
-) {
-  const test =
-    await fetchTest(testId);
+/* =========================================================
+   ESCAPE
+========================================================= */
 
-  if (!isDraft(test)) {
-    return safeSend(
-      chatId,
-      "🔒 Test is locked."
-    );
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/* =========================================================
+   CREATE TEST
+========================================================= */
+
+async function startCreateTest(chatId) {
+  setSession(chatId, {
+    state: "create_title",
+    draftTest: {}
+  });
+
+  await send(
+    chatId,
+    "➕ <b>Create Test</b>\n\nEnter test title:"
+  );
+}
+
+async function processCreateTest(msg) {
+  const chatId = msg.chat.id;
+  const session = getSession(chatId);
+
+  if (!session || !session.state?.startsWith("create_")) {
+    return false;
   }
 
-  const patch = {};
+  const text = msg.text.trim();
+
+  if (session.state === "create_title") {
+    if (!text) {
+      await send(chatId, "❌ Title cannot be empty.");
+      return true;
+    }
+
+    setSession(chatId, {
+      state: "create_description",
+      draftTest: {
+        ...session.draftTest,
+        title: text
+      }
+    });
+
+    await send(chatId, "Enter description (or type <code>skip</code>):");
+    return true;
+  }
+
+  if (session.state === "create_description") {
+    setSession(chatId, {
+      state: "create_date",
+      draftTest: {
+        ...session.draftTest,
+        description: text.toLowerCase() === "skip" ? null : text
+      }
+    });
+
+    await send(chatId, "Enter test date (YYYY-MM-DD) or <code>skip</code>:");
+    return true;
+  }
+
+  if (session.state === "create_date") {
+    let date = null;
+
+    if (text.toLowerCase() !== "skip") {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+        await send(chatId, "❌ Use YYYY-MM-DD format.");
+        return true;
+      }
+
+      date = text;
+    }
+
+    setSession(chatId, {
+      state: "create_time",
+      draftTest: {
+        ...session.draftTest,
+        test_date: date
+      }
+    });
+
+    await send(chatId, "Enter test time (HH:MM) or <code>skip</code>:");
+    return true;
+  }
+
+  if (session.state === "create_time") {
+    let time = null;
+
+    if (text.toLowerCase() !== "skip") {
+      if (!/^\d{1,2}:\d{2}$/.test(text)) {
+        await send(chatId, "❌ Use HH:MM format.");
+        return true;
+      }
+
+      time = text;
+    }
+
+    setSession(chatId, {
+      state: "create_duration",
+      draftTest: {
+        ...session.draftTest,
+        test_time: time
+      }
+    });
+
+    await send(chatId, "Enter duration in minutes:");
+    return true;
+  }
+
+  if (session.state === "create_duration") {
+    const duration = Number(text);
+
+    if (!Number.isInteger(duration) || duration <= 0) {
+      await send(chatId, "❌ Duration must be a positive number.");
+      return true;
+    }
+
+    setSession(chatId, {
+      state: "create_marks",
+      draftTest: {
+        ...session.draftTest,
+        duration_minutes: duration
+      }
+    });
+
+    await send(chatId, "Enter marks per question:");
+    return true;
+  }
+
+  if (session.state === "create_marks") {
+    const marks = Number(text);
+
+    if (!Number.isFinite(marks) || marks <= 0) {
+      await send(chatId, "❌ Marks must be greater than 0.");
+      return true;
+    }
+
+    setSession(chatId, {
+      state: "create_negative",
+      draftTest: {
+        ...session.draftTest,
+        marks_per_question: marks
+      }
+    });
+
+    await send(
+      chatId,
+      "Negative marking?\n\nReply <code>yes</code> or <code>no</code>:"
+    );
+
+    return true;
+  }
+
+  if (session.state === "create_negative") {
+    const lower = text.toLowerCase();
+
+    if (!["yes", "no"].includes(lower)) {
+      await send(chatId, "❌ Reply yes or no.");
+      return true;
+    }
+
+    if (lower === "no") {
+      setSession(chatId, {
+        state: "create_instructions",
+        draftTest: {
+          ...session.draftTest,
+          negative_marking_enabled: false,
+          negative_marking_value: 0
+        }
+      });
+
+      await send(chatId, "Enter instructions or <code>skip</code>:");
+      return true;
+    }
+
+    setSession(chatId, {
+      state: "create_negative_value",
+      draftTest: {
+        ...session.draftTest,
+        negative_marking_enabled: true
+      }
+    });
+
+    await send(chatId, "Enter negative marking value:");
+    return true;
+  }
+
+  if (session.state === "create_negative_value") {
+    const negative = Number(text);
+
+    if (!Number.isFinite(negative) || negative < 0) {
+      await send(chatId, "❌ Negative value must be 0 or greater.");
+      return true;
+    }
+
+    setSession(chatId, {
+      state: "create_instructions",
+      draftTest: {
+        ...session.draftTest,
+        negative_marking_value: negative
+      }
+    });
+
+    await send(chatId, "Enter instructions or <code>skip</code>:");
+    return true;
+  }
+
+  if (session.state === "create_instructions") {
+    const draft = {
+      ...session.draftTest,
+      instructions:
+        text.toLowerCase() === "skip" ? null : text,
+      status: "draft",
+      total_questions: 0,
+      total_marks: 0
+    };
+
+    const { data, error } = await supabase
+      .from("tests")
+      .insert(draft)
+      .select()
+      .single();
+
+    if (error) {
+      console.error(error);
+      clearSession(chatId);
+      await send(chatId, "❌ Could not create test.");
+      return true;
+    }
+
+    clearSession(chatId);
+
+    await send(
+      chatId,
+      `✅ <b>Test created successfully.</b>\n\nTest: <b>${escapeHtml(data.title)}</b>`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "❓ Add Questions",
+                callback_data: `${PREFIX}questions:${data.id}`
+              }
+            ],
+            [
+              {
+                text: "📚 Select Subjects",
+                callback_data: `${PREFIX}tsub:${data.id}`
+              }
+            ],
+            [
+              {
+                text: "📝 Test Details",
+                callback_data: `${PREFIX}test:${data.id}`
+              }
+            ]
+          ]
+        }
+      }
+    );
+
+    return true;
+  }
+
+  return false;
+}
+
+/* =========================================================
+   EDIT TEST MENU
+========================================================= */
+
+async function showEditTestMenu(chatId, testId) {
+  const test = await getTest(testId);
+
+  if (!test) {
+    await send(chatId, "❌ Test not found.");
+    return;
+  }
+
+  if (test.status !== "draft") {
+    await send(
+      chatId,
+      "🔒 This test is locked because it is no longer a draft.",
+      {
+        reply_markup: backKeyboard(`test:${testId}`)
+      }
+    );
+    return;
+  }
+
+  const buttons = [
+    [
+      {
+        text: `Title: ${shortValue(test.title)}`,
+        callback_data: `${PREFIX}field:title:${testId}`
+      }
+    ],
+    [
+      {
+        text: "✏️ Edit Title",
+        callback_data: `${PREFIX}editfield:title:${testId}`
+      }
+    ],
+    [
+      {
+        text: `Description: ${shortValue(test.description)}`,
+        callback_data: `${PREFIX}field:desc:${testId}`
+      }
+    ],
+    [
+      {
+        text: "✏️ Edit Description",
+        callback_data: `${PREFIX}editfield:desc:${testId}`
+      }
+    ],
+    [
+      {
+        text: `Date: ${shortValue(test.test_date)}`,
+        callback_data: `${PREFIX}field:date:${testId}`
+      }
+    ],
+    [
+      {
+        text: "✏️ Edit Date",
+        callback_data: `${PREFIX}editfield:date:${testId}`
+      }
+    ],
+    [
+      {
+        text: `Time: ${shortValue(test.test_time)}`,
+        callback_data: `${PREFIX}field:time:${testId}`
+      }
+    ],
+    [
+      {
+        text: "✏️ Edit Time",
+        callback_data: `${PREFIX}editfield:time:${testId}`
+      }
+    ],
+    [
+      {
+        text: `Duration: ${test.duration_minutes} min`,
+        callback_data: `${PREFIX}field:duration:${testId}`
+      }
+    ],
+    [
+      {
+        text: "✏️ Edit Duration",
+        callback_data: `${PREFIX}editfield:duration:${testId}`
+      }
+    ],
+    [
+      {
+        text: `Marks/Question: ${test.marks_per_question}`,
+        callback_data: `${PREFIX}field:marks:${testId}`
+      }
+    ],
+    [
+      {
+        text: "✏️ Edit Marks",
+        callback_data: `${PREFIX}editfield:marks:${testId}`
+      }
+    ],
+    [
+      {
+        text: `Negative: ${
+          test.negative_marking_enabled
+            ? `Yes (-${test.negative_marking_value})`
+            : "No"
+        }`,
+        callback_data: `${PREFIX}field:negative:${testId}`
+      }
+    ],
+    [
+      {
+        text: "✏️ Edit Negative Marking",
+        callback_data: `${PREFIX}editfield:negative:${testId}`
+      }
+    ],
+    [
+      {
+        text: `Instructions: ${shortValue(test.instructions)}`,
+        callback_data: `${PREFIX}field:instructions:${testId}`
+      }
+    ],
+    [
+      {
+        text: "✏️ Edit Instructions",
+        callback_data: `${PREFIX}editfield:instructions:${testId}`
+      }
+    ],
+    [
+      {
+        text: "❓ Questions",
+        callback_data: `${PREFIX}questions:${testId}`
+      }
+    ],
+    [
+      {
+        text: "⬅️ Back",
+        callback_data: `${PREFIX}test:${testId}`
+      }
+    ]
+  ];
+
+  await send(
+    chatId,
+    "✏️ <b>Edit Test</b>\n\nCurrent values are shown below.",
+    {
+      reply_markup: {
+        inline_keyboard: buttons
+      }
+    }
+  );
+}
+
+function shortValue(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    String(value).trim() === ""
+  ) {
+    return "Not set";
+  }
+
+  const text = String(value);
+
+  return text.length > 30
+    ? `${text.slice(0, 27)}...`
+    : text;
+}
+
+/* =========================================================
+   EDIT TEST FIELD
+========================================================= */
+
+async function showFieldValue(chatId, testId, field) {
+  const test = await getTest(testId);
+
+  if (!test) {
+    await send(chatId, "❌ Test not found.");
+    return;
+  }
+
+  const values = {
+    title: ["Title", test.title],
+    desc: ["Description", test.description],
+    date: ["Date", test.test_date],
+    time: ["Time", test.test_time],
+    duration: ["Duration", `${test.duration_minutes} minutes`],
+    marks: ["Marks/Question", test.marks_per_question],
+    negative: [
+      "Negative Marking",
+      test.negative_marking_enabled
+        ? `Yes (-${test.negative_marking_value})`
+        : "No"
+    ],
+    instructions: ["Instructions", test.instructions]
+  };
+
+  const item = values[field];
+
+  if (!item) {
+    await send(chatId, "❌ Invalid field.");
+    return;
+  }
+
+  await send(
+    chatId,
+    `📌 <b>${item[0]}</b>\n\n${escapeHtml(
+      item[1] ?? "Not set"
+    )}`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "✏️ Edit",
+              callback_data: `${PREFIX}editfield:${field}:${testId}`
+            }
+          ],
+          [
+            {
+              text: "⬅️ Back",
+              callback_data: `${PREFIX}edit:${testId}`
+            }
+          ]
+        ]
+      }
+    }
+  );
+}
+
+async function startEditField(chatId, testId, field) {
+  const test = await getTest(testId);
+
+  if (!test) {
+    await send(chatId, "❌ Test not found.");
+    return;
+  }
+
+  if (test.status !== "draft") {
+    await send(chatId, "🔒 Test is locked.");
+    return;
+  }
+
+  const prompts = {
+    title: "Enter new title:",
+    desc: "Enter new description or <code>skip</code> to clear it:",
+    date: "Enter date in YYYY-MM-DD format:",
+    time: "Enter time in HH:MM format:",
+    duration: "Enter duration in minutes:",
+    marks: "Enter marks per question:",
+    negative: "Enter <code>yes</code> or <code>no</code>:",
+    instructions: "Enter instructions or <code>skip</code> to clear:"
+  };
+
+  setSession(chatId, {
+    state: "edit_field",
+    editTestId: testId,
+    editField: field
+  });
+
+  await send(chatId, prompts[field] || "Enter new value:");
+}
+
+async function processEditField(msg) {
+  const chatId = msg.chat.id;
+  const session = getSession(chatId);
+
+  if (!session || session.state !== "edit_field") {
+    return false;
+  }
+
+  const text = msg.text.trim();
+  const field = session.editField;
+  const testId = session.editTestId;
+
+  const update = {};
 
   if (field === "title") {
-    if (!value.trim()) {
-      return safeSend(
-        chatId,
-        "❌ Title cannot be empty."
-      );
+    if (!text) {
+      await send(chatId, "❌ Title cannot be empty.");
+      return true;
     }
 
-    patch.title = value.trim();
+    update.title = text;
   }
 
-  else if (field === "desc") {
-    patch.description =
-      value || null;
+  if (field === "desc") {
+    update.description =
+      text.toLowerCase() === "skip" ? null : text;
   }
 
-  else if (field === "date") {
-    if (
-      value &&
-      !/^\d{4}-\d{2}-\d{2}$/.test(
-        value
-      )
-    ) {
-      return safeSend(
-        chatId,
-        "❌ Use YYYY-MM-DD."
-      );
+  if (field === "date") {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+      await send(chatId, "❌ Use YYYY-MM-DD.");
+      return true;
     }
 
-    patch.test_date =
-      value || null;
+    update.test_date = text;
   }
 
-  else if (field === "time") {
-    if (
-      value &&
-      !/^\d{2}:\d{2}$/.test(
-        value
-      )
-    ) {
-      return safeSend(
-        chatId,
-        "❌ Use HH:MM."
-      );
+  if (field === "time") {
+    if (!/^\d{1,2}:\d{2}$/.test(text)) {
+      await send(chatId, "❌ Use HH:MM.");
+      return true;
     }
 
-    patch.test_time =
-      value || null;
+    update.test_time = text;
   }
 
-  else if (field === "duration") {
-    const number = Number(value);
+  if (field === "duration") {
+    const value = Number(text);
 
-    if (
-      !Number.isInteger(number) ||
-      number <= 0
-    ) {
-      return safeSend(
-        chatId,
-        "❌ Duration must be a positive integer."
-      );
+    if (!Number.isInteger(value) || value <= 0) {
+      await send(chatId, "❌ Duration must be positive.");
+      return true;
     }
 
-    patch.duration_minutes =
-      number;
+    update.duration_minutes = value;
   }
 
-  else if (field === "marks") {
-    const number = Number(value);
+  if (field === "marks") {
+    const value = Number(text);
 
-    if (!(number > 0)) {
-      return safeSend(
-        chatId,
-        "❌ Marks must be positive."
-      );
+    if (!Number.isFinite(value) || value <= 0) {
+      await send(chatId, "❌ Marks must be greater than 0.");
+      return true;
     }
 
-    patch.marks_per_question =
-      number;
+    update.marks_per_question = value;
   }
 
-  else if (field === "negative") {
-    const parts = String(value)
-      .split(",")
-      .map(item => item.trim());
+  if (field === "negative") {
+    const lower = text.toLowerCase();
 
-    const enabled =
-      parts[0].toLowerCase() ===
-      "yes";
-
-    const number =
-      Number(parts[1] || 1);
-
-    if (
-      enabled &&
-      !(number >= 0)
-    ) {
-      return safeSend(
-        chatId,
-        "❌ Invalid negative marks."
-      );
+    if (!["yes", "no"].includes(lower)) {
+      await send(chatId, "❌ Reply yes or no.");
+      return true;
     }
 
-    patch.negative_marking_enabled =
-      enabled;
+    if (lower === "no") {
+      update.negative_marking_enabled = false;
+      update.negative_marking_value = 0;
+    } else {
+      setSession(chatId, {
+        state: "edit_negative_value",
+        editTestId: testId,
+        editField: field
+      });
 
-    patch.negative_marking_value =
-      number >= 0
-        ? number
-        : 1;
+      await send(chatId, "Enter negative marking value:");
+      return true;
+    }
   }
 
-  else if (field === "instructions") {
-    patch.instructions =
-      value || null;
+  if (field === "instructions") {
+    update.instructions =
+      text.toLowerCase() === "skip" ? null : text;
   }
 
-  const {
-    error
-  } = await supabase
+  if (Object.keys(update).length === 0) {
+    return true;
+  }
+
+  const { error } = await supabase
     .from("tests")
     .update({
-      ...patch,
-      updated_at:
-        new Date().toISOString()
+      ...update,
+      updated_at: new Date().toISOString()
     })
-    .eq("id", testId);
+    .eq("id", testId)
+    .eq("status", "draft");
 
   if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
+    console.error(error);
+    await send(chatId, "❌ Could not update test.");
+    return true;
   }
 
-  resetSession(chatId);
+  clearSession(chatId);
 
-  getSession(chatId).authenticated =
-    true;
+  await send(chatId, "✅ Test updated successfully.", {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "✏️ Edit Test",
+            callback_data: `${PREFIX}edit:${testId}`
+          }
+        ],
+        [
+          {
+            text: "📝 Test Details",
+            callback_data: `${PREFIX}test:${testId}`
+          }
+        ]
+      ]
+    }
+  });
 
-  await safeSend(
-    chatId,
-    "✅ Updated."
-  );
+  return true;
+}
 
-  await showEditTestMenu(
-    chatId,
-    testId
-  );
+async function processEditNegativeValue(msg) {
+  const chatId = msg.chat.id;
+  const session = getSession(chatId);
+
+  if (!session || session.state !== "edit_negative_value") {
+    return false;
+  }
+
+  const value = Number(msg.text.trim());
+
+  if (!Number.isFinite(value) || value < 0) {
+    await send(chatId, "❌ Value must be 0 or greater.");
+    return true;
+  }
+
+  const { error } = await supabase
+    .from("tests")
+    .update({
+      negative_marking_enabled: true,
+      negative_marking_value: value,
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", session.editTestId)
+    .eq("status", "draft");
+
+  if (error) {
+    console.error(error);
+    await send(chatId, "❌ Could not update negative marking.");
+    return true;
+  }
+
+  const testId = session.editTestId;
+
+  clearSession(chatId);
+
+  await send(chatId, "✅ Negative marking updated.", {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "✏️ Edit Test",
+            callback_data: `${PREFIX}edit:${testId}`
+          }
+        ]
+      ]
+    }
+  });
+
+  return true;
 }
 
 /* =========================================================
@@ -1168,559 +1256,421 @@ async function saveTestField(
 ========================================================= */
 
 async function showSubjects(chatId) {
-  const {
-    data,
-    error
-  } = await supabase
+  const { data, error } = await supabase
     .from("subjects")
     .select("*")
     .order("name");
 
   if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
+    console.error(error);
+    await send(chatId, "❌ Could not load subjects.");
+    return;
   }
 
-  const rows =
-    (data || []).map(subject => [
-      {
-        text:
-          `${subject.is_active ? "🟢" : "⚪"} ${subject.name}`,
-        callback_data:
-          `${CALLBACK_PREFIX}es:${subject.id}`
-      }
-    ]);
+  const buttons = (data || []).map(subject => [
+    {
+      text: `${subject.is_active ? "🟢" : "⚪"} ${subject.name}`,
+      callback_data: `${PREFIX}subject:${subject.id}`
+    }
+  ]);
 
-  rows.push([
+  buttons.push([
     {
       text: "➕ Add Subject",
-      callback_data:
-        `${CALLBACK_PREFIX}ns`
+      callback_data: `${PREFIX}addsub`
     }
   ]);
 
-  rows.push([
+  buttons.push([
     {
-      text: "⬅️ Panel",
-      callback_data:
-        `${CALLBACK_PREFIX}panel`
+      text: "⬅️ Back",
+      callback_data: `${PREFIX}panel`
     }
   ]);
 
-  await safeSend(
+  await send(
     chatId,
-    "📚 *Subjects*\n\n🟢 Active  ⚪ Inactive",
+    "📚 <b>Subjects</b>\n\n🟢 Active\n⚪ Inactive",
     {
-      parse_mode: "Markdown",
       reply_markup: {
-        inline_keyboard: rows
+        inline_keyboard: buttons
       }
     }
   );
 }
 
-async function startNewSubject(chatId) {
-  const session = getSession(chatId);
+async function showSubject(chatId, subjectId) {
+  const { data, error } = await supabase
+    .from("subjects")
+    .select("*")
+    .eq("id", subjectId)
+    .maybeSingle();
 
-  session.state = "subject_new";
-  session.data = {};
-  session.authenticated = true;
+  if (error || !data) {
+    await send(chatId, "❌ Subject not found.");
+    return;
+  }
 
-  await safeSend(
+  await send(
     chatId,
-    "➕ Enter subject name:"
+    `📚 <b>${escapeHtml(data.name)}</b>
+
+Status: ${data.is_active ? "🟢 Active" : "⚪ Inactive"}`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "✏️ Edit",
+              callback_data: `${PREFIX}editsub:${subjectId}`
+            }
+          ],
+          [
+            {
+              text: data.is_active
+                ? "⚪ Deactivate"
+                : "🟢 Activate",
+              callback_data: `${PREFIX}togsub:${subjectId}`
+            }
+          ],
+          [
+            {
+              text: "⬅️ Back",
+              callback_data: `${PREFIX}subjects`
+            }
+          ]
+        ]
+      }
+    }
   );
 }
 
-async function startEditSubject(
-  chatId,
-  subjectId
-) {
-  const {
-    data
-  } = await supabase
+async function startAddSubject(chatId) {
+  setSession(chatId, {
+    state: "add_subject"
+  });
+
+  await send(chatId, "📚 Enter subject name:");
+}
+
+async function startEditSubject(chatId, subjectId) {
+  const { data } = await supabase
     .from("subjects")
     .select("*")
     .eq("id", subjectId)
     .maybeSingle();
 
   if (!data) {
-    return safeSend(
-      chatId,
-      "❌ Subject not found."
-    );
+    await send(chatId, "❌ Subject not found.");
+    return;
   }
 
-  const session =
-    getSession(chatId);
-
-  session.state =
-    "subject_edit";
-
-  session.data = {
+  setSession(chatId, {
+    state: "edit_subject",
     subjectId
-  };
+  });
 
-  session.authenticated = true;
-
-  await safeSend(
+  await send(
     chatId,
-    `✏️ Current name: ${data.name}\n\nEnter new name:`
+    `✏️ Current name: <b>${escapeHtml(data.name)}</b>\n\nEnter new name:`
   );
 }
 
-async function saveNewSubject(
-  chatId,
-  name
-) {
-  name = normalizeName(name);
+async function processSubjectInput(msg) {
+  const chatId = msg.chat.id;
+  const session = getSession(chatId);
+  const text = msg.text.trim();
 
-  if (!name) {
-    return safeSend(
-      chatId,
-      "❌ Name cannot be empty."
-    );
-  }
+  if (!session) return false;
 
-  const {
-    error
-  } = await supabase
-    .from("subjects")
-    .insert({
-      name,
-      is_active: true
+  if (session.state === "add_subject") {
+    if (!text) {
+      await send(chatId, "❌ Name cannot be empty.");
+      return true;
+    }
+
+    const { error } = await supabase
+      .from("subjects")
+      .insert({
+        name: text,
+        is_active: true
+      });
+
+    if (error) {
+      console.error(error);
+      await send(chatId, "❌ Could not add subject.");
+      return true;
+    }
+
+    clearSession(chatId);
+    await send(chatId, "✅ Subject added.", {
+      reply_markup: backKeyboard("subjects")
     });
 
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
+    return true;
   }
 
-  resetSession(chatId);
+  if (session.state === "edit_subject") {
+    if (!text) {
+      await send(chatId, "❌ Name cannot be empty.");
+      return true;
+    }
 
-  getSession(chatId).authenticated =
-    true;
+    const { error } = await supabase
+      .from("subjects")
+      .update({
+        name: text
+      })
+      .eq("id", session.subjectId);
 
-  await safeSend(
-    chatId,
-    "✅ Subject added."
-  );
+    if (error) {
+      console.error(error);
+      await send(
+        chatId,
+        "❌ Could not rename subject.\n\nMake sure another subject doesn't already have this name."
+      );
+      return true;
+    }
 
-  await showSubjects(chatId);
-}
+    clearSession(chatId);
 
-async function saveEditedSubject(
-  chatId,
-  subjectId,
-  name
-) {
-  name = normalizeName(name);
+    await send(chatId, "✅ Subject renamed.", {
+      reply_markup: backKeyboard("subjects")
+    });
 
-  if (!name) {
-    return safeSend(
-      chatId,
-      "❌ Name cannot be empty."
-    );
+    return true;
   }
 
-  const {
-    error
-  } = await supabase
-    .from("subjects")
-    .update({
-      name,
-      updated_at:
-        new Date().toISOString()
-    })
-    .eq("id", subjectId);
-
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
-  }
-
-  resetSession(chatId);
-
-  getSession(chatId).authenticated =
-    true;
-
-  await safeSend(
-    chatId,
-    "✅ Subject renamed."
-  );
-
-  await showSubjects(chatId);
-}
-
-async function removeSubject(
-  chatId,
-  subjectId
-) {
-  const {
-    data,
-    error
-  } = await supabase
-    .from("subjects")
-    .update({
-      is_active: false
-    })
-    .eq("id", subjectId)
-    .select()
-    .maybeSingle();
-
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
-  }
-
-  if (!data) {
-    return safeSend(
-      chatId,
-      "❌ Subject not found."
-    );
-  }
-
-  await safeSend(
-    chatId,
-    "✅ Subject deactivated."
-  );
-
-  await showSubjects(chatId);
+  return false;
 }
 
 /* =========================================================
    TEST SUBJECTS
 ========================================================= */
 
-async function showTestSubjects(
-  chatId,
-  testId
-) {
-  const test =
-    await fetchTest(testId);
+async function showTestSubjects(chatId, testId) {
+  const test = await getTest(testId);
 
   if (!test) {
-    return safeSend(
-      chatId,
-      "❌ Test not found."
-    );
+    await send(chatId, "❌ Test not found.");
+    return;
   }
 
-  if (!isDraft(test)) {
-    return safeSend(
-      chatId,
-      "🔒 Test is locked."
-    );
+  if (test.status !== "draft") {
+    await send(chatId, "🔒 Test is locked.");
+    return;
   }
 
-  const {
-    data: subjects
-  } = await supabase
+  const { data: subjects } = await supabase
     .from("subjects")
     .select("*")
     .eq("is_active", true)
     .order("name");
 
-  const {
-    data: links
-  } = await supabase
+  const { data: selected } = await supabase
     .from("test_subjects")
     .select("subject_id")
     .eq("test_id", testId);
 
-  const selected =
-    new Set(
-      (links || []).map(
-        item => item.subject_id
-      )
-    );
+  const selectedIds = new Set(
+    (selected || []).map(x => x.subject_id)
+  );
 
-  const rows =
-    (subjects || []).map(subject => [
-      {
-        text:
-          `${selected.has(subject.id) ? "☑️" : "⬜"} ${subject.name}`,
-        callback_data:
-          `${CALLBACK_PREFIX}tog:${testId}:${subject.id}`
-      }
-    ]);
-
-  rows.push([
+  const buttons = (subjects || []).map(subject => [
     {
-      text: "✅ Done",
-      callback_data:
-        `${CALLBACK_PREFIX}et:${testId}`
+      text: `${selectedIds.has(subject.id) ? "✅" : "⬜"} ${subject.name}`,
+      callback_data: `${PREFIX}togsubtest:${testId}:${subject.id}`
     }
   ]);
 
-  await safeSend(
+  buttons.push([
+    {
+      text: "⬅️ Back",
+      callback_data: `${PREFIX}test:${testId}`
+    }
+  ]);
+
+  await send(
     chatId,
-    `📚 Subjects for ${test.title}:`,
+    "📚 <b>Select Subjects</b>\n\nTap subjects to toggle them.",
     {
       reply_markup: {
-        inline_keyboard: rows
+        inline_keyboard: buttons
       }
     }
   );
 }
 
-async function toggleTestSubject(
-  chatId,
-  testId,
-  subjectId
-) {
-  const test =
-    await fetchTest(testId);
+async function toggleTestSubject(chatId, testId, subjectId) {
+  const test = await getTest(testId);
 
-  if (!isDraft(test)) {
-    return safeSend(
-      chatId,
-      "🔒 Test is locked."
-    );
+  if (!test || test.status !== "draft") {
+    await send(chatId, "🔒 Test is locked.");
+    return;
   }
 
-  const {
-    data: existing
-  } = await supabase
+  const { data } = await supabase
     .from("test_subjects")
     .select("*")
     .eq("test_id", testId)
     .eq("subject_id", subjectId)
     .maybeSingle();
 
-  let error;
-
-  if (existing) {
-    ({
-      error
-    } = await supabase
+  if (data) {
+    await supabase
       .from("test_subjects")
       .delete()
       .eq("test_id", testId)
-      .eq(
-        "subject_id",
-        subjectId
-      ));
+      .eq("subject_id", subjectId);
   } else {
-    ({
-      error
-    } = await supabase
+    await supabase
       .from("test_subjects")
       .insert({
         test_id: testId,
         subject_id: subjectId
-      }));
+      });
   }
 
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
-  }
-
-  await showTestSubjects(
-    chatId,
-    testId
-  );
+  await showTestSubjects(chatId, testId);
 }
 
 /* =========================================================
-   QUESTION BUILDER MENU
+   QUESTION BUILDER
 ========================================================= */
 
-async function showQuestionMenu(
-  chatId,
-  testId
-) {
-  const test =
-    await fetchTest(testId);
+async function showQuestionMenu(chatId, testId) {
+  const test = await getTest(testId);
 
   if (!test) {
-    return safeSend(
-      chatId,
-      "❌ Test not found."
-    );
+    await send(chatId, "❌ Test not found.");
+    return;
   }
 
-  const locked =
-    !isDraft(test);
+  const locked = test.status !== "draft";
 
-  const rows = [];
-
-  if (!locked) {
-    rows.push([
-      {
-        text: "➕ Add Question",
-        callback_data:
-          `${CALLBACK_PREFIX}aq:${testId}`
-      }
-    ]);
-  }
-
-  rows.push([
-    {
-      text: "📋 View Questions",
-      callback_data:
-        `${CALLBACK_PREFIX}vq:${testId}`
-    }
-  ]);
-
-  if (!locked) {
-    rows.push([
-      {
-        text: "✏️ Edit Question",
-        callback_data:
-          `${CALLBACK_PREFIX}eqpick:${testId}`
-      }
-    ]);
-
-    rows.push([
-      {
-        text: "🗑️ Delete Question",
-        callback_data:
-          `${CALLBACK_PREFIX}dqpick:${testId}`
-      }
-    ]);
-  }
-
-  rows.push([
-    {
-      text: "⬅️ Back",
-      callback_data:
-        `${CALLBACK_PREFIX}et:${testId}`
-    }
-  ]);
-
-  await safeSend(
+  await send(
     chatId,
-`❓ *Question Builder*
+    `❓ <b>Question Builder</b>
 
-Test: ${escapeMarkdown(test.title)}
+Test: <b>${escapeHtml(test.title)}</b>
 Questions: ${test.total_questions}
-Marks: ${test.total_marks}
+Total Marks: ${test.total_marks}
 
 ${
-      locked
-        ? `🔒 Locked because test is ${test.status}.`
-        : "Choose an action:"
-    }`,
+  locked
+    ? "🔒 This test is locked."
+    : "Choose an action:"
+}`,
     {
-      parse_mode: "Markdown",
       reply_markup: {
-        inline_keyboard: rows
+        inline_keyboard: [
+          ...(locked
+            ? []
+            : [
+                [
+                  {
+                    text: "➕ Add Question",
+                    callback_data: `${PREFIX}addq:${testId}`
+                  }
+                ]
+              ]),
+          [
+            {
+              text: "📋 View Questions",
+              callback_data: `${PREFIX}viewq:${testId}`
+            }
+          ],
+          ...(locked
+            ? []
+            : [
+                [
+                  {
+                    text: "✏️ Edit Question",
+                    callback_data: `${PREFIX}editqmenu:${testId}`
+                  }
+                ],
+                [
+                  {
+                    text: "🗑️ Delete Question",
+                    callback_data: `${PREFIX}delqmenu:${testId}`
+                  }
+                ]
+              ]),
+          [
+            {
+              text: "⬅️ Back",
+              callback_data: `${PREFIX}test:${testId}`
+            }
+          ]
+        ]
       }
     }
   );
-}
-
-/* =========================================================
-   NEXT QUESTION NUMBER
-========================================================= */
-
-async function nextQuestionNumber(
-  testId
-) {
-  const {
-    data
-  } = await supabase
-    .from("questions")
-    .select("question_number")
-    .eq("test_id", testId)
-    .order("question_number", {
-      ascending: false
-    })
-    .limit(1);
-
-  if (
-    data &&
-    data.length
-  ) {
-    return (
-      Number(data[0].question_number) +
-      1
-    );
-  }
-
-  return 1;
 }
 
 /* =========================================================
    ADD QUESTION
 ========================================================= */
 
-async function startAddQuestion(
-  chatId,
-  testId
-) {
-  const test =
-    await fetchTest(testId);
+async function startAddQuestion(chatId, testId) {
+  const test = await getTest(testId);
 
-  if (!isDraft(test)) {
-    return safeSend(
-      chatId,
-      "🔒 Test is locked."
-    );
+  if (!test) {
+    await send(chatId, "❌ Test not found.");
+    return;
   }
 
-  const session =
-    getSession(chatId);
+  if (test.status !== "draft") {
+    await send(chatId, "🔒 Published/ended tests cannot be edited.");
+    return;
+  }
 
-  session.state =
-    "question_type";
+  const { count } = await supabase
+    .from("questions")
+    .select("*", {
+      count: "exact",
+      head: true
+    })
+    .eq("test_id", testId);
 
-  session.data = {
+  const nextNumber = (count || 0) + 1;
+
+  setSession(chatId, {
+    state: "question_type",
+    questionMode: "add",
     testId,
-    questionNumber:
-      await nextQuestionNumber(
-        testId
-      )
-  };
+    questionNumber: nextNumber,
+    questionData: {}
+  });
 
-  session.authenticated = true;
-
-  await safeSend(
+  await send(
     chatId,
-`➕ Question #${session.data.questionNumber}
-
-Select question type:`,
+    `➕ <b>Add Question ${nextNumber}</b>\n\nSelect question type:`,
     {
       reply_markup: {
         inline_keyboard: [
           [
             {
-              text: "MCQ",
-              callback_data:
-                `${CALLBACK_PREFIX}qtype:mcq`
+              text: "🔘 MCQ",
+              callback_data: `${PREFIX}qtype:mcq`
             }
           ],
           [
             {
-              text: "Multiple Correct",
-              callback_data:
-                `${CALLBACK_PREFIX}qtype:multiple_correct`
+              text: "☑️ Multiple Correct",
+              callback_data: `${PREFIX}qtype:multiple_correct`
             }
           ],
           [
             {
-              text: "Numerical",
-              callback_data:
-                `${CALLBACK_PREFIX}qtype:numerical`
+              text: "🔢 Numerical",
+              callback_data: `${PREFIX}qtype:numerical`
             }
           ],
           [
             {
               text: "❌ Cancel",
-              callback_data:
-                `${CALLBACK_PREFIX}cancel`
+              callback_data: `${PREFIX}questions:${testId}`
             }
           ]
         ]
@@ -1729,1247 +1679,830 @@ Select question type:`,
   );
 }
 
-/* =========================================================
-   SAVE QUESTION
-========================================================= */
+async function chooseQuestionType(chatId, type) {
+  const session = getSession(chatId);
 
-async function saveQuestion(chatId) {
-  const session =
-    getSession(chatId);
-
-  const data =
-    session.data;
-
-  const questionPayload = {
-    test_id: data.testId,
-    question_number:
-      data.questionNumber,
-    question_text:
-      data.questionText,
-    question_type:
-      data.questionType,
-    marks: data.marks,
-    negative_marks:
-      data.negativeMarks
-  };
-
-  const {
-    data: question,
-    error
-  } = await supabase
-    .from("questions")
-    .insert(questionPayload)
-    .select()
-    .single();
-
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
+  if (!session || session.state !== "question_type") {
+    await send(chatId, "❌ Question session expired. Start again.");
+    return;
   }
 
-  if (
-    data.questionType !==
-    "numerical"
-  ) {
-    const options =
-      data.options.map(
-        (text, index) => ({
-          question_id:
-            question.id,
-          option_label:
-            String.fromCharCode(
-              65 + index
-            ),
-          option_text:
-            text,
-          option_order:
-            index + 1
-        })
-      );
-
-    const {
-      error: optionsError
-    } = await supabase
-      .from("question_options")
-      .insert(options);
-
-    if (optionsError) {
-      await supabase
-        .from("questions")
-        .delete()
-        .eq(
-          "id",
-          question.id
-        );
-
-      return safeSend(
-        chatId,
-        `❌ ${optionsError.message}`
-      );
+  setSession(chatId, {
+    state: "question_text",
+    questionData: {
+      ...session.questionData,
+      question_type: type
     }
-  }
-
-  await recalcTestTotals(
-    data.testId
-  );
-
-  resetSession(chatId);
-
-  getSession(chatId).authenticated =
-    true;
-
-  await safeSend(
-    chatId,
-    `✅ Question #${data.questionNumber} saved.`
-  );
-
-  await showQuestionMenu(
-    chatId,
-    data.testId
-  );
-}
-
-/* =========================================================
-   PROCESS ADD QUESTION INPUT
-========================================================= */
-
-async function processQuestionInput(
-  chatId,
-  text
-) {
-  const session =
-    getSession(chatId);
-
-  const data =
-    session.data;
-
-  if (
-    session.state ===
-    "question_text"
-  ) {
-    data.questionText =
-      text.trim();
-
-    if (!data.questionText) {
-      return safeSend(
-        chatId,
-        "❌ Question text cannot be empty."
-      );
-    }
-
-    /*
-      IMPORTANT:
-      Numerical questions DO NOT ask
-      for the correct answer here.
-      Answer key is entered later.
-    */
-
-    if (
-      data.questionType ===
-      "numerical"
-    ) {
-      session.state =
-        "question_marks";
-
-      return safeSend(
-        chatId,
-        "Enter marks (positive number):"
-      );
-    }
-
-    session.state =
-      "option_a";
-
-    return safeSend(
-      chatId,
-      "Option A:"
-    );
-  }
-
-  if (
-    session.state === "option_a" ||
-    session.state === "option_b" ||
-    session.state === "option_c" ||
-    session.state === "option_d"
-  ) {
-    const indexMap = {
-      option_a: 0,
-      option_b: 1,
-      option_c: 2,
-      option_d: 3
-    };
-
-    const index =
-      indexMap[session.state];
-
-    data.options =
-      data.options || [];
-
-    if (!text.trim()) {
-      return safeSend(
-        chatId,
-        "❌ Option cannot be empty."
-      );
-    }
-
-    data.options[index] =
-      text.trim();
-
-    if (
-      session.state ===
-      "option_a"
-    ) {
-      session.state =
-        "option_b";
-
-      return safeSend(
-        chatId,
-        "Option B:"
-      );
-    }
-
-    if (
-      session.state ===
-      "option_b"
-    ) {
-      session.state =
-        "option_c";
-
-      return safeSend(
-        chatId,
-        "Option C:"
-      );
-    }
-
-    if (
-      session.state ===
-      "option_c"
-    ) {
-      session.state =
-        "option_d";
-
-      return safeSend(
-        chatId,
-        "Option D:"
-      );
-    }
-
-    session.state =
-      "question_marks";
-
-    return safeSend(
-      chatId,
-      "Enter marks (positive number):"
-    );
-  }
-
-  if (
-    session.state ===
-    "question_marks"
-  ) {
-    const number =
-      Number(text);
-
-    if (!(number > 0)) {
-      return safeSend(
-        chatId,
-        "❌ Marks must be positive."
-      );
-    }
-
-    data.marks =
-      number;
-
-    session.state =
-      "question_negative";
-
-    return safeSend(
-      chatId,
-      "Enter negative marks (0 or positive number):"
-    );
-  }
-
-  if (
-    session.state ===
-    "question_negative"
-  ) {
-    const number =
-      Number(text);
-
-    if (!(number >= 0)) {
-      return safeSend(
-        chatId,
-        "❌ Negative marks must be 0 or more."
-      );
-    }
-
-    data.negativeMarks =
-      number;
-
-    return saveQuestion(
-      chatId
-    );
-  }
-}
-
-/* =========================================================
-   VIEW QUESTIONS
-========================================================= */
-
-async function viewQuestions(
-  chatId,
-  testId,
-  page = 0
-) {
-  const limit = 8;
-
-  const from =
-    page * limit;
-
-  const to =
-    from + limit - 1;
-
-  const {
-    data,
-    error
-  } = await supabase
-    .from("questions")
-    .select(
-      "id,question_number,question_text,question_type,marks,negative_marks"
-    )
-    .eq("test_id", testId)
-    .order("question_number")
-    .range(from, to);
-
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
-  }
-
-  if (
-    !data.length &&
-    page === 0
-  ) {
-    return safeSend(
-      chatId,
-      "📋 No questions yet."
-    );
-  }
-
-  let text =
-    "📋 *Questions*\n\n";
-
-  for (const question of data) {
-    text +=
-      `*Q${question.question_number}* [${question.question_type}] +${question.marks}/-${question.negative_marks}\n` +
-      `${escapeMarkdown(question.question_text.slice(0, 180))}\n\n`;
-  }
-
-  const buttons = [];
-
-  if (page > 0) {
-    buttons.push({
-      text: "⬅️ Prev",
-      callback_data:
-        `${CALLBACK_PREFIX}vqp:${testId}:${page - 1}`
-    });
-  }
-
-  if (
-    data.length ===
-    limit
-  ) {
-    buttons.push({
-      text: "Next ➡️",
-      callback_data:
-        `${CALLBACK_PREFIX}vqn:${testId}:${page + 1}`
-    });
-  }
-
-  buttons.push({
-    text: "⬅️ Back",
-    callback_data:
-      `${CALLBACK_PREFIX}qm:${testId}`
   });
 
-  await safeSend(
+  await send(
     chatId,
-    text,
-    {
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: [
-          buttons
-        ]
-      }
-    }
+    `📝 <b>Question ${session.questionNumber}</b>\n\nEnter question text:`
   );
 }
 
-/* =========================================================
-   QUESTION PICKER
-========================================================= */
+async function processQuestionBuilder(msg) {
+  const chatId = msg.chat.id;
+  const session = getSession(chatId);
 
-async function pickQuestion(
-  chatId,
-  testId,
-  mode
-) {
-  const {
-    data,
-    error
-  } = await supabase
-    .from("questions")
-    .select(
-      "id,question_number,question_text"
-    )
-    .eq("test_id", testId)
-    .order("question_number");
+  if (!session) return false;
 
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
-  }
+  if (session.state === "question_text") {
+    const text = msg.text.trim();
 
-  if (!data.length) {
-    return safeSend(
-      chatId,
-      "No questions."
-    );
-  }
-
-  const rows =
-    data.map(question => [
-      {
-        text:
-          `Q${question.question_number}: ${question.question_text.slice(0, 45)}`,
-        callback_data:
-          `${CALLBACK_PREFIX}${mode}:${question.id}`
-      }
-    ]);
-
-  rows.push([
-    {
-      text: "⬅️ Back",
-      callback_data:
-        `${CALLBACK_PREFIX}qm:${testId}`
+    if (!text) {
+      await send(chatId, "❌ Question text cannot be empty.");
+      return true;
     }
-  ]);
 
-  await safeSend(
-    chatId,
-    mode === "eqpick"
-      ? "✏️ Select question to edit:"
-      : "🗑️ Select question to delete:",
-    {
-      reply_markup: {
-        inline_keyboard: rows
+    setSession(chatId, {
+      state:
+        session.questionData.question_type === "numerical"
+          ? "question_marks"
+          : "question_option_a",
+      questionData: {
+        ...session.questionData,
+        question_text: text
       }
+    });
+
+    if (
+      session.questionData.question_type === "numerical"
+    ) {
+      await send(chatId, "Enter marks:");
+    } else {
+      await send(chatId, "Enter option A:");
     }
-  );
-}
 
-/* =========================================================
-   LOAD QUESTION
-========================================================= */
-
-async function loadQuestion(
-  questionId
-) {
-  const {
-    data,
-    error
-  } = await supabase
-    .from("questions")
-    .select("*")
-    .eq("id", questionId)
-    .maybeSingle();
-
-  if (error) {
-    return null;
+    return true;
   }
 
-  return data;
-}
+  if (
+    session.state === "question_option_a" ||
+    session.state === "question_option_b" ||
+    session.state === "question_option_c" ||
+    session.state === "question_option_d"
+  ) {
+    const text = msg.text.trim();
 
-/* =========================================================
-   EDIT QUESTION
-========================================================= */
-
-async function startEditQuestion(
-  chatId,
-  questionId
-) {
-  const question =
-    await loadQuestion(
-      questionId
-    );
-
-  if (!question) {
-    return safeSend(
-      chatId,
-      "❌ Question not found."
-    );
-  }
-
-  const test =
-    await fetchTest(
-      question.test_id
-    );
-
-  if (!isDraft(test)) {
-    return safeSend(
-      chatId,
-      "🔒 Test is locked."
-    );
-  }
-
-  const {
-    data: options
-  } = await supabase
-    .from("question_options")
-    .select("*")
-    .eq(
-      "question_id",
-      questionId
-    )
-    .order("option_order");
-
-  const session =
-    getSession(chatId);
-
-  session.state =
-    "edit_question_menu";
-
-  session.data = {
-    questionId,
-    testId:
-      question.test_id
-  };
-
-  session.authenticated =
-    true;
-
-  await showEditQuestionMenu(
-    chatId,
-    question,
-    options || []
-  );
-}
-
-async function showEditQuestionMenu(
-  chatId,
-  question,
-  options
-) {
-  let body =
-`✏️ *Edit Q${question.question_number}*
-
-${escapeMarkdown(question.question_text)}
-Type: ${question.question_type}
-Marks: ${question.marks}
-Negative: ${question.negative_marks}`;
-
-  if (options.length) {
-    body +=
-      "\n\n" +
-      options
-        .map(
-          option =>
-            `${option.option_label}. ${escapeMarkdown(option.option_text)}`
-        )
-        .join("\n");
-  }
-
-  const rows = [
-    [
-      {
-        text: "Question Text",
-        callback_data:
-          `${CALLBACK_PREFIX}eqf:text:${question.id}`
-      }
-    ],
-    [
-      {
-        text: "Question Type",
-        callback_data:
-          `${CALLBACK_PREFIX}eqf:type:${question.id}`
-      }
-    ]
-  ];
-
-  if (options.length) {
-    rows.push([
-      {
-        text: "Options",
-        callback_data:
-          `${CALLBACK_PREFIX}eqf:opts:${question.id}`
-      }
-    ]);
-  }
-
-  rows.push([
-    {
-      text: "Marks",
-      callback_data:
-        `${CALLBACK_PREFIX}eqf:marks:${question.id}`
-    },
-    {
-      text: "Negative",
-      callback_data:
-        `${CALLBACK_PREFIX}eqf:neg:${question.id}`
+    if (!text) {
+      await send(chatId, "❌ Option cannot be empty.");
+      return true;
     }
-  ]);
 
-  rows.push([
-    {
-      text: "⬅️ Back",
-      callback_data:
-        `${CALLBACK_PREFIX}qm:${question.test_id}`
+    const optionKey = {
+      question_option_a: "A",
+      question_option_b: "B",
+      question_option_c: "C",
+      question_option_d: "D"
+    }[session.state];
+
+    const options = {
+      ...(session.questionData.options || {}),
+      [optionKey]: text
+    };
+
+    const nextState = {
+      question_option_a: "question_option_b",
+      question_option_b: "question_option_c",
+      question_option_c: "question_option_d",
+      question_option_d: "question_marks"
+    }[session.state];
+
+    setSession(chatId, {
+      state: nextState,
+      questionData: {
+        ...session.questionData,
+        options
+      }
+    });
+
+    if (nextState === "question_marks") {
+      await send(chatId, "Enter marks:");
+    } else {
+      const nextLetter = {
+        question_option_b: "B",
+        question_option_c: "C",
+        question_option_d: "D"
+      }[nextState];
+
+      await send(chatId, `Enter option ${nextLetter}:`);
     }
-  ]);
 
-  await safeSend(
-    chatId,
-    body,
-    {
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: rows
+    return true;
+  }
+
+  if (session.state === "question_marks") {
+    const marks = Number(msg.text.trim());
+
+    if (!Number.isFinite(marks) || marks <= 0) {
+      await send(chatId, "❌ Marks must be greater than 0.");
+      return true;
+    }
+
+    setSession(chatId, {
+      state: "question_negative",
+      questionData: {
+        ...session.questionData,
+        marks
+      }
+    });
+
+    await send(chatId, "Enter negative marks (0 allowed):");
+    return true;
+  }
+
+  if (session.state === "question_negative") {
+    const negative = Number(msg.text.trim());
+
+    if (!Number.isFinite(negative) || negative < 0) {
+      await send(chatId, "❌ Negative marks cannot be negative.");
+      return true;
+    }
+
+    const data = {
+      ...session.questionData,
+      negative_marks: negative
+    };
+
+    const { data: question, error } = await supabase
+      .from("questions")
+      .insert({
+        test_id: session.testId,
+        question_number: session.questionNumber,
+        question_text: data.question_text,
+        question_type: data.question_type,
+        marks: data.marks,
+        negative_marks: data.negative_marks
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error(error);
+      await send(chatId, "❌ Could not save question.");
+      return true;
+    }
+
+    if (
+      data.question_type === "mcq" ||
+      data.question_type === "multiple_correct"
+    ) {
+      const letters = ["A", "B", "C", "D"];
+
+      const optionRows = letters.map((letter, index) => ({
+        question_id: question.id,
+        option_label: letter,
+        option_text: data.options[letter],
+        option_order: index + 1
+      }));
+
+      const { error: optionError } = await supabase
+        .from("question_options")
+        .insert(optionRows);
+
+      if (optionError) {
+        console.error(optionError);
+
+        await supabase
+          .from("questions")
+          .delete()
+          .eq("id", question.id);
+
+        await send(chatId, "❌ Could not save options.");
+        return true;
       }
     }
-  );
-}
 
-async function editQuestionField(
-  chatId,
-  questionId,
-  field
-) {
-  const question =
-    await loadQuestion(
-      questionId
-    );
+    await recalculateTestTotals(session.testId);
 
-  if (!question) {
-    return safeSend(
+    const testId = session.testId;
+    clearSession(chatId);
+
+    await send(
       chatId,
-      "❌ Question not found."
-    );
-  }
+      `✅ <b>Question ${question.question_number} saved.</b>
 
-  const session =
-    getSession(chatId);
+Type: ${data.question_type}
+Marks: ${data.marks}
+Negative: ${data.negative_marks}
 
-  session.state =
-    `edit_${field}`;
-
-  session.data = {
-    questionId,
-    testId:
-      question.test_id
-  };
-
-  if (field === "type") {
-    return safeSend(
-      chatId,
-      "Select new type:",
+Correct answer is NOT entered here.`,
       {
         reply_markup: {
           inline_keyboard: [
             [
               {
-                text: "MCQ",
-                callback_data:
-                  `${CALLBACK_PREFIX}eqt:mcq:${questionId}`
+                text: "➕ Add Another",
+                callback_data: `${PREFIX}addq:${testId}`
               }
             ],
             [
               {
-                text: "Multiple Correct",
-                callback_data:
-                  `${CALLBACK_PREFIX}eqt:multiple_correct:${questionId}`
+                text: "📋 View Questions",
+                callback_data: `${PREFIX}viewq:${testId}`
               }
             ],
             [
               {
-                text: "Numerical",
-                callback_data:
-                  `${CALLBACK_PREFIX}eqt:numerical:${questionId}`
+                text: "⬅️ Question Builder",
+                callback_data: `${PREFIX}questions:${testId}`
               }
             ]
           ]
         }
       }
     );
+
+    return true;
   }
 
-  if (field === "opts") {
-    const {
-      data: options
-    } = await supabase
-      .from("question_options")
-      .select("*")
-      .eq(
-        "question_id",
-        questionId
-      )
-      .order("option_order");
-
-    session.data.options =
-      (options || []).map(
-        option =>
-          option.option_text
-      );
-
-    session.state =
-      "edit_option_a";
-
-    return safeSend(
-      chatId,
-      "Option A:"
-    );
-  }
-
-  const prompts = {
-    text:
-      "Enter new question text:",
-    marks:
-      "Enter new marks:",
-    neg:
-      "Enter new negative marks:"
-  };
-
-  await safeSend(
-    chatId,
-    prompts[field] ||
-      "Enter value:"
-  );
+  return false;
 }
 
-async function updateQuestionText(
-  chatId,
-  text
-) {
-  const session =
-    getSession(chatId);
+/* =========================================================
+   VIEW QUESTIONS
+========================================================= */
 
-  const question =
-    await loadQuestion(
-      session.data.questionId
-    );
+async function viewQuestions(chatId, testId, page = 0) {
+  const test = await getTest(testId);
 
-  if (!text.trim()) {
-    return safeSend(
-      chatId,
-      "❌ Cannot be empty."
-    );
+  if (!test) {
+    await send(chatId, "❌ Test not found.");
+    return;
   }
 
+  const pageSize = 5;
+  const from = page * pageSize;
+  const to = from + pageSize - 1;
+
   const {
-    error
+    data,
+    error,
+    count
   } = await supabase
     .from("questions")
-    .update({
-      question_text:
-        text.trim()
+    .select("*", {
+      count: "exact"
     })
-    .eq(
-      "id",
-      question.id
-    );
+    .eq("test_id", testId)
+    .order("question_number")
+    .range(from, to);
 
   if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
+    console.error(error);
+    await send(chatId, "❌ Could not load questions.");
+    return;
   }
 
-  return finishQuestionEdit(
+  if (!data?.length) {
+    await send(
+      chatId,
+      "📋 <b>Questions</b>\n\nNo questions added yet.",
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "➕ Add Question",
+                callback_data: `${PREFIX}addq:${testId}`
+              }
+            ],
+            [
+              {
+                text: "⬅️ Back",
+                callback_data: `${PREFIX}questions:${testId}`
+              }
+            ]
+          ]
+        }
+      }
+    );
+
+    return;
+  }
+
+  let text = `📋 <b>Questions</b>\n\n`;
+
+  for (const q of data) {
+    text += `<b>Q${q.question_number}</b> [${q.question_type}]\n`;
+    text += `${escapeHtml(q.question_text.slice(0, 120))}\n`;
+    text += `Marks: ${q.marks} | Negative: ${q.negative_marks}\n\n`;
+  }
+
+  const buttons = [];
+
+  if (page > 0) {
+    buttons.push([
+      {
+        text: "⬅️ Previous",
+        callback_data: `${PREFIX}viewq:${testId}:${page - 1}`
+      }
+    ]);
+  }
+
+  if (count && to + 1 < count) {
+    buttons.push([
+      {
+        text: "Next ➡️",
+        callback_data: `${PREFIX}viewq:${testId}:${page + 1}`
+      }
+    ]);
+  }
+
+  buttons.push([
+    {
+      text: "⬅️ Question Builder",
+      callback_data: `${PREFIX}questions:${testId}`
+    }
+  ]);
+
+  await send(chatId, text, {
+    reply_markup: {
+      inline_keyboard: buttons
+    }
+  });
+}
+
+/* =========================================================
+   EDIT QUESTION MENU
+========================================================= */
+
+async function showEditQuestionMenu(chatId, testId) {
+  const { data, error } = await supabase
+    .from("questions")
+    .select("*")
+    .eq("test_id", testId)
+    .order("question_number");
+
+  if (error) {
+    console.error(error);
+    await send(chatId, "❌ Could not load questions.");
+    return;
+  }
+
+  if (!data?.length) {
+    await send(chatId, "❌ No questions to edit.");
+    return;
+  }
+
+  const buttons = data.map(q => [
+    {
+      text: `Q${q.question_number} — ${q.question_type}`,
+      callback_data: `${PREFIX}editoneq:${q.id}`
+    }
+  ]);
+
+  buttons.push([
+    {
+      text: "⬅️ Back",
+      callback_data: `${PREFIX}questions:${testId}`
+    }
+  ]);
+
+  await send(
     chatId,
-    question.id
+    "✏️ <b>Edit Question</b>\n\nSelect a question:",
+    {
+      reply_markup: {
+        inline_keyboard: buttons
+      }
+    }
   );
 }
 
-async function finishQuestionEdit(
-  chatId,
-  questionId
-) {
-  const question =
-    await loadQuestion(
-      questionId
-    );
+async function showEditQuestion(chatId, questionId) {
+  const { data: question } = await supabase
+    .from("questions")
+    .select("*")
+    .eq("id", questionId)
+    .maybeSingle();
 
-  resetSession(chatId);
+  if (!question) {
+    await send(chatId, "❌ Question not found.");
+    return;
+  }
 
-  getSession(chatId).authenticated =
-    true;
+  const test = await getTest(question.test_id);
 
-  await safeSend(
-    chatId,
-    "✅ Question updated."
-  );
+  if (!test || test.status !== "draft") {
+    await send(chatId, "🔒 Question is locked.");
+    return;
+  }
 
-  const {
-    data: options
-  } = await supabase
+  const { data: options } = await supabase
     .from("question_options")
     .select("*")
-    .eq(
-      "question_id",
-      questionId
-    )
+    .eq("question_id", questionId)
     .order("option_order");
 
-  await showEditQuestionMenu(
-    chatId,
-    question,
-    options || []
-  );
-}
+  let text = `✏️ <b>Question ${question.question_number}</b>
 
-/* =========================================================
-   SAVE EDITED OPTIONS
-========================================================= */
+<b>Type:</b> ${question.question_type}
+<b>Question:</b>
+${escapeHtml(question.question_text)}
 
-async function saveEditedOptions(
-  chatId
-) {
-  const session =
-    getSession(chatId);
+<b>Marks:</b> ${question.marks}
+<b>Negative:</b> ${question.negative_marks}`;
 
-  const question =
-    await loadQuestion(
-      session.data.questionId
-    );
+  if (options?.length) {
+    text += "\n\n";
 
-  if (!question) {
-    return safeSend(
-      chatId,
-      "❌ Question not found."
-    );
-  }
-
-  if (
-    question.question_type ===
-    "numerical"
-  ) {
-    return safeSend(
-      chatId,
-      "❌ Numerical questions do not have options."
-    );
-  }
-
-  const options =
-    session.data.options || [];
-
-  if (
-    options.length !== 4 ||
-    options.some(
-      value =>
-        !String(value || "").trim()
-    )
-  ) {
-    return safeSend(
-      chatId,
-      "❌ All four options are required."
-    );
-  }
-
-  const {
-    error: deleteError
-  } = await supabase
-    .from("question_options")
-    .delete()
-    .eq(
-      "question_id",
-      question.id
-    );
-
-  if (deleteError) {
-    return safeSend(
-      chatId,
-      `❌ ${deleteError.message}`
-    );
-  }
-
-  const rows =
-    options.map(
-      (text, index) => ({
-        question_id:
-          question.id,
-        option_label:
-          String.fromCharCode(
-            65 + index
-          ),
-        option_text:
-          String(text).trim(),
-        option_order:
-          index + 1
-      })
-    );
-
-  const {
-    error: insertError
-  } = await supabase
-    .from("question_options")
-    .insert(rows);
-
-  if (insertError) {
-    return safeSend(
-      chatId,
-      `❌ ${insertError.message}`
-    );
-  }
-
-  return finishQuestionEdit(
-    chatId,
-    question.id
-  );
-}
-
-/* =========================================================
-   CHANGE QUESTION TYPE
-========================================================= */
-
-async function changeQuestionType(
-  chatId,
-  type,
-  questionId
-) {
-  const question =
-    await loadQuestion(
-      questionId
-    );
-
-  if (!question) {
-    return safeSend(
-      chatId,
-      "❌ Question not found."
-    );
-  }
-
-  const test =
-    await fetchTest(
-      question.test_id
-    );
-
-  if (!isDraft(test)) {
-    return safeSend(
-      chatId,
-      "🔒 Test is locked."
-    );
-  }
-
-  if (
-    question.question_type ===
-    type
-  ) {
-    return finishQuestionEdit(
-      chatId,
-      questionId
-    );
-  }
-
-  if (
-    question.question_type !==
-    "numerical"
-  ) {
-    const {
-      error
-    } = await supabase
-      .from("question_options")
-      .delete()
-      .eq(
-        "question_id",
-        questionId
-      );
-
-    if (error) {
-      return safeSend(
-        chatId,
-        `❌ ${error.message}`
-      );
+    for (const option of options) {
+      text += `${option.option_label}. ${escapeHtml(option.option_text)}\n`;
     }
   }
 
-  const {
-    error
-  } = await supabase
+  await send(chatId, text, {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "📝 Edit Text",
+            callback_data: `${PREFIX}eqtext:${questionId}`
+          }
+        ],
+        [
+          {
+            text: "💯 Edit Marks",
+            callback_data: `${PREFIX}eqmarks:${questionId}`
+          }
+        ],
+        [
+          {
+            text: "➖ Edit Negative",
+            callback_data: `${PREFIX}eqneg:${questionId}`
+          }
+        ],
+        ...(options?.length
+          ? [
+              [
+                {
+                  text: "🔤 Edit Options",
+                  callback_data: `${PREFIX}eqopts:${questionId}`
+                }
+              ]
+            ]
+          : []),
+        [
+          {
+            text: "⬅️ Back",
+            callback_data: `${PREFIX}editqmenu:${question.test_id}`
+          }
+        ]
+      ]
+    }
+  });
+}
+
+async function startQuestionEdit(chatId, questionId, field) {
+  const { data: question } = await supabase
     .from("questions")
-    .update({
-      question_type: type
-    })
-    .eq(
-      "id",
-      questionId
-    );
+    .select("*")
+    .eq("id", questionId)
+    .maybeSingle();
 
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
+  if (!question) {
+    await send(chatId, "❌ Question not found.");
+    return;
   }
 
-  /*
-    IMPORTANT:
-    Numerical type does NOT ask for
-    a correct numerical answer.
-    Answer key is entered later.
-  */
+  const test = await getTest(question.test_id);
 
-  if (type === "numerical") {
-    return finishQuestionEdit(
-      chatId,
-      questionId
-    );
+  if (!test || test.status !== "draft") {
+    await send(chatId, "🔒 Question is locked.");
+    return;
   }
 
-  const session =
-    getSession(chatId);
-
-  session.state =
-    "edit_option_a";
-
-  session.data = {
-    questionId,
-    testId:
-      question.test_id,
-    options: []
+  const states = {
+    text: "edit_q_text",
+    marks: "edit_q_marks",
+    neg: "edit_q_neg"
   };
 
-  return safeSend(
-    chatId,
-    "Option A:"
-  );
+  setSession(chatId, {
+    state: states[field],
+    questionId,
+    testId: question.test_id
+  });
+
+  if (field === "text") {
+    await send(
+      chatId,
+      `Current text:\n\n${escapeHtml(question.question_text)}\n\nEnter new question text:`
+    );
+  }
+
+  if (field === "marks") {
+    await send(
+      chatId,
+      `Current marks: <b>${question.marks}</b>\n\nEnter new marks:`
+    );
+  }
+
+  if (field === "neg") {
+    await send(
+      chatId,
+      `Current negative marks: <b>${question.negative_marks}</b>\n\nEnter new negative marks:`
+    );
+  }
+}
+
+async function processQuestionEdit(msg) {
+  const chatId = msg.chat.id;
+  const session = getSession(chatId);
+
+  if (!session) return false;
+
+  if (
+    ![
+      "edit_q_text",
+      "edit_q_marks",
+      "edit_q_neg"
+    ].includes(session.state)
+  ) {
+    return false;
+  }
+
+  const text = msg.text.trim();
+
+  const update = {};
+
+  if (session.state === "edit_q_text") {
+    if (!text) {
+      await send(chatId, "❌ Question text cannot be empty.");
+      return true;
+    }
+
+    update.question_text = text;
+  }
+
+  if (session.state === "edit_q_marks") {
+    const value = Number(text);
+
+    if (!Number.isFinite(value) || value <= 0) {
+      await send(chatId, "❌ Marks must be greater than 0.");
+      return true;
+    }
+
+    update.marks = value;
+  }
+
+  if (session.state === "edit_q_neg") {
+    const value = Number(text);
+
+    if (!Number.isFinite(value) || value < 0) {
+      await send(chatId, "❌ Negative marks cannot be negative.");
+      return true;
+    }
+
+    update.negative_marks = value;
+  }
+
+  const { error } = await supabase
+    .from("questions")
+    .update(update)
+    .eq("id", session.questionId);
+
+  if (error) {
+    console.error(error);
+    await send(chatId, "❌ Could not update question.");
+    return true;
+  }
+
+  await recalculateTestTotals(session.testId);
+
+  const questionId = session.questionId;
+
+  clearSession(chatId);
+
+  await send(chatId, "✅ Question updated.", {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "✏️ Continue Editing",
+            callback_data: `${PREFIX}editoneq:${questionId}`
+          }
+        ],
+        [
+          {
+            text: "⬅️ Question Builder",
+            callback_data: `${PREFIX}questions:${session.testId}`
+          }
+        ]
+      ]
+    }
+  });
+
+  return true;
 }
 
 /* =========================================================
-   PROCESS EDIT QUESTION INPUT
+   EDIT OPTIONS
 ========================================================= */
 
-async function processEditInput(
-  chatId,
-  text
-) {
-  const session =
-    getSession(chatId);
-
-  const data =
-    session.data;
-
-  const question =
-    await loadQuestion(
-      data.questionId
-    );
+async function showEditOptions(chatId, questionId) {
+  const { data: question } = await supabase
+    .from("questions")
+    .select("*")
+    .eq("id", questionId)
+    .maybeSingle();
 
   if (!question) {
-    return safeSend(
-      chatId,
-      "❌ Question not found."
-    );
+    await send(chatId, "❌ Question not found.");
+    return;
   }
 
-  if (
-    session.state ===
-    "edit_text"
-  ) {
-    return updateQuestionText(
-      chatId,
-      text
-    );
+  const { data: options } = await supabase
+    .from("question_options")
+    .select("*")
+    .eq("question_id", questionId)
+    .order("option_order");
+
+  const buttons = (options || []).map(option => [
+    {
+      text: `${option.option_label}: ${shortValue(option.option_text)}`,
+      callback_data: `${PREFIX}editopt:${option.id}`
+    }
+  ]);
+
+  buttons.push([
+    {
+      text: "⬅️ Back",
+      callback_data: `${PREFIX}editoneq:${questionId}`
+    }
+  ]);
+
+  await send(chatId, "🔤 <b>Edit Options</b>\n\nSelect an option:", {
+    reply_markup: {
+      inline_keyboard: buttons
+    }
+  });
+}
+
+async function startEditOption(chatId, optionId) {
+  const { data: option } = await supabase
+    .from("question_options")
+    .select("*")
+    .eq("id", optionId)
+    .maybeSingle();
+
+  if (!option) {
+    await send(chatId, "❌ Option not found.");
+    return;
   }
 
-  if (
-    session.state ===
-    "edit_marks"
-  ) {
-    const number =
-      Number(text);
+  const { data: question } = await supabase
+    .from("questions")
+    .select("test_id")
+    .eq("id", option.question_id)
+    .maybeSingle();
 
-    if (!(number > 0)) {
-      return safeSend(
-        chatId,
-        "❌ Marks must be positive."
-      );
-    }
+  setSession(chatId, {
+    state: "edit_option",
+    optionId,
+    questionId: option.question_id,
+    testId: question?.test_id
+  });
 
-    const {
-      error
-    } = await supabase
-      .from("questions")
-      .update({
-        marks: number
-      })
-      .eq(
-        "id",
-        question.id
-      );
+  await send(
+    chatId,
+    `Current ${option.option_label}:\n\n${escapeHtml(option.option_text)}\n\nEnter new option text:`
+  );
+}
 
-    if (error) {
-      return safeSend(
-        chatId,
-        `❌ ${error.message}`
-      );
-    }
+async function processEditOption(msg) {
+  const chatId = msg.chat.id;
+  const session = getSession(chatId);
 
-    return finishQuestionEdit(
-      chatId,
-      question.id
-    );
+  if (!session || session.state !== "edit_option") {
+    return false;
   }
 
-  if (
-    session.state ===
-    "edit_neg"
-  ) {
-    const number =
-      Number(text);
+  const text = msg.text.trim();
 
-    if (!(number >= 0)) {
-      return safeSend(
-        chatId,
-        "❌ Negative marks must be 0 or more."
-      );
-    }
-
-    const {
-      error
-    } = await supabase
-      .from("questions")
-      .update({
-        negative_marks:
-          number
-      })
-      .eq(
-        "id",
-        question.id
-      );
-
-    if (error) {
-      return safeSend(
-        chatId,
-        `❌ ${error.message}`
-      );
-    }
-
-    return finishQuestionEdit(
-      chatId,
-      question.id
-    );
+  if (!text) {
+    await send(chatId, "❌ Option cannot be empty.");
+    return true;
   }
 
-  if (
-    /^edit_option_[a-d]$/.test(
-      session.state
-    )
-  ) {
-    const indexMap = {
-      edit_option_a: 0,
-      edit_option_b: 1,
-      edit_option_c: 2,
-      edit_option_d: 3
-    };
+  const { error } = await supabase
+    .from("question_options")
+    .update({
+      option_text: text
+    })
+    .eq("id", session.optionId);
 
-    const index =
-      indexMap[session.state];
-
-    if (!text.trim()) {
-      return safeSend(
-        chatId,
-        "❌ Option cannot be empty."
-      );
-    }
-
-    data.options =
-      data.options || [];
-
-    data.options[index] =
-      text.trim();
-
-    if (index < 3) {
-      const states = [
-        "edit_option_a",
-        "edit_option_b",
-        "edit_option_c",
-        "edit_option_d"
-      ];
-
-      session.state =
-        states[index + 1];
-
-      return safeSend(
-        chatId,
-        `Option ${String.fromCharCode(66 + index)}:`
-      );
-    }
-
-    return saveEditedOptions(
-      chatId
-    );
+  if (error) {
+    console.error(error);
+    await send(chatId, "❌ Could not update option.");
+    return true;
   }
+
+  const questionId = session.questionId;
+
+  clearSession(chatId);
+
+  await send(chatId, "✅ Option updated.", {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "🔤 Edit Options",
+            callback_data: `${PREFIX}eqopts:${questionId}`
+          }
+        ],
+        [
+          {
+            text: "⬅️ Question",
+            callback_data: `${PREFIX}editoneq:${questionId}`
+          }
+        ]
+      ]
+    }
+  });
+
+  return true;
 }
 
 /* =========================================================
    DELETE QUESTION
 ========================================================= */
 
-async function confirmDeleteQuestion(
-  chatId,
-  questionId
-) {
-  const question =
-    await loadQuestion(
-      questionId
-    );
+async function showDeleteQuestionMenu(chatId, testId) {
+  const { data, error } = await supabase
+    .from("questions")
+    .select("id, question_number, question_text")
+    .eq("test_id", testId)
+    .order("question_number");
+
+  if (error) {
+    console.error(error);
+    await send(chatId, "❌ Could not load questions.");
+    return;
+  }
+
+  if (!data?.length) {
+    await send(chatId, "❌ No questions to delete.");
+    return;
+  }
+
+  const buttons = data.map(q => [
+    {
+      text: `🗑️ Q${q.question_number}`,
+      callback_data: `${PREFIX}confirmdel:${q.id}`
+    }
+  ]);
+
+  buttons.push([
+    {
+      text: "⬅️ Back",
+      callback_data: `${PREFIX}questions:${testId}`
+    }
+  ]);
+
+  await send(
+    chatId,
+    "🗑️ <b>Delete Question</b>\n\nSelect a question:",
+    {
+      reply_markup: {
+        inline_keyboard: buttons
+      }
+    }
+  );
+}
+
+async function confirmDeleteQuestion(chatId, questionId) {
+  const { data: question } = await supabase
+    .from("questions")
+    .select("*")
+    .eq("id", questionId)
+    .maybeSingle();
 
   if (!question) {
-    return safeSend(
-      chatId,
-      "❌ Question not found."
-    );
+    await send(chatId, "❌ Question not found.");
+    return;
   }
 
-  const test =
-    await fetchTest(
-      question.test_id
-    );
-
-  if (!isDraft(test)) {
-    return safeSend(
-      chatId,
-      "🔒 Test is locked."
-    );
-  }
-
-  await safeSend(
+  await send(
     chatId,
-`⚠️ Delete Q${question.question_number}?
+    `⚠️ <b>Delete Question ${question.question_number}?</b>
 
-This will also delete its options.`,
+${escapeHtml(question.question_text)}`,
     {
       reply_markup: {
         inline_keyboard: [
           [
             {
-              text: "❌ Yes, delete",
-              callback_data:
-                `${CALLBACK_PREFIX}del:${questionId}`
+              text: "🗑️ Yes, Delete",
+              callback_data: `${PREFIX}doDelete:${questionId}`
             }
           ],
           [
             {
-              text: "Cancel",
-              callback_data:
-                `${CALLBACK_PREFIX}qm:${question.test_id}`
+              text: "❌ Cancel",
+              callback_data: `${PREFIX}delqmenu:${question.test_id}`
             }
           ]
         ]
@@ -2978,145 +2511,94 @@ This will also delete its options.`,
   );
 }
 
-async function deleteQuestion(
-  chatId,
-  questionId
-) {
-  const question =
-    await loadQuestion(
-      questionId
-    );
+async function deleteQuestion(chatId, questionId) {
+  const { data: question, error: questionError } =
+    await supabase
+      .from("questions")
+      .select("*")
+      .eq("id", questionId)
+      .maybeSingle();
+
+  if (questionError) {
+    console.error(questionError);
+    await send(chatId, "❌ Could not find question.");
+    return;
+  }
 
   if (!question) {
-    return safeSend(
-      chatId,
-      "❌ Question not found."
-    );
+    await send(chatId, "❌ Question not found.");
+    return;
   }
 
-  const test =
-    await fetchTest(
-      question.test_id
-    );
+  const test = await getTest(question.test_id);
 
-  if (!isDraft(test)) {
-    return safeSend(
-      chatId,
-      "🔒 Test is locked."
-    );
+  if (!test || test.status !== "draft") {
+    await send(chatId, "🔒 Test is locked.");
+    return;
   }
 
-  const {
-    error: deleteError
-  } = await supabase
+  const { error: deleteError } = await supabase
     .from("questions")
     .delete()
-    .eq(
-      "id",
-      questionId
-    );
+    .eq("id", questionId);
 
   if (deleteError) {
-    return safeSend(
-      chatId,
-      `❌ ${deleteError.message}`
-    );
+    console.error(deleteError);
+    await send(chatId, "❌ Could not delete question.");
+    return;
   }
 
-  const {
-    data: remaining,
-    error: remainingError
-  } = await supabase
-    .from("questions")
-    .select(
-      "id,question_number"
-    )
-    .eq(
-      "test_id",
-      question.test_id
-    )
-    .order("question_number");
+  const { data: remaining, error: remainingError } =
+    await supabase
+      .from("questions")
+      .select("id")
+      .eq("test_id", question.test_id)
+      .order("question_number");
 
   if (remainingError) {
-    return safeSend(
-      chatId,
-      `❌ ${remainingError.message}`
-    );
-  }
+    console.error(remainingError);
+  } else {
+    /*
+      Temporary numbering avoids UNIQUE(test_id, question_number)
+      conflicts while renumbering.
+    */
 
-  /*
-    Temporary numbering avoids
-    unique(test_id, question_number)
-    conflicts during renumbering.
-  */
+    for (let i = 0; i < remaining.length; i++) {
+      await supabase
+        .from("questions")
+        .update({
+          question_number: -(i + 1)
+        })
+        .eq("id", remaining[i].id);
+    }
 
-  for (
-    let index = 0;
-    index < remaining.length;
-    index++
-  ) {
-    const temporaryNumber =
-      1000000 + index;
-
-    const {
-      error
-    } = await supabase
-      .from("questions")
-      .update({
-        question_number:
-          temporaryNumber
-      })
-      .eq(
-        "id",
-        remaining[index].id
-      );
-
-    if (error) {
-      return safeSend(
-        chatId,
-        `❌ ${error.message}`
-      );
+    for (let i = 0; i < remaining.length; i++) {
+      await supabase
+        .from("questions")
+        .update({
+          question_number: i + 1
+        })
+        .eq("id", remaining[i].id);
     }
   }
 
-  for (
-    let index = 0;
-    index < remaining.length;
-    index++
-  ) {
-    const {
-      error
-    } = await supabase
-      .from("questions")
-      .update({
-        question_number:
-          index + 1
-      })
-      .eq(
-        "id",
-        remaining[index].id
-      );
+  await recalculateTestTotals(question.test_id);
 
-    if (error) {
-      return safeSend(
-        chatId,
-        `❌ ${error.message}`
-      );
+  await send(
+    chatId,
+    `✅ Question ${question.question_number} deleted.\n\nRemaining questions have been renumbered.`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "❓ Question Builder",
+              callback_data: `${PREFIX}questions:${question.test_id}`
+            }
+          ]
+        ]
+      }
     }
-  }
-
-  await recalcTestTotals(
-    question.test_id
-  );
-
-  await safeSend(
-    chatId,
-    "🗑️ Question deleted and remaining questions renumbered."
-  );
-
-  await showQuestionMenu(
-    chatId,
-    question.test_id
   );
 }
 
@@ -3124,265 +2606,147 @@ async function deleteQuestion(
    TEST TOTALS
 ========================================================= */
 
-async function recalcTestTotals(
-  testId
-) {
-  const {
-    data,
-    error
-  } = await supabase
+async function recalculateTestTotals(testId) {
+  const { data: questions, error } = await supabase
     .from("questions")
     .select("marks")
-    .eq(
-      "test_id",
-      testId
-    );
+    .eq("test_id", testId);
 
   if (error) {
-    console.error(
-      "recalcTestTotals:",
-      error.message
-    );
-
+    console.error("Totals error:", error);
     return;
   }
 
-  const totalMarks =
-    (data || []).reduce(
-      (sum, question) =>
-        sum +
-        Number(
-          question.marks || 0
-        ),
-      0
-    );
+  const totalQuestions = questions?.length || 0;
 
-  await supabase
+  const totalMarks = (questions || []).reduce(
+    (sum, q) => sum + Number(q.marks || 0),
+    0
+  );
+
+  const { error: updateError } = await supabase
     .from("tests")
     .update({
-      total_questions:
-        (data || []).length,
-      total_marks:
-        totalMarks,
-      updated_at:
-        new Date().toISOString()
+      total_questions: totalQuestions,
+      total_marks: totalMarks,
+      updated_at: new Date().toISOString()
     })
-    .eq(
-      "id",
-      testId
-    );
+    .eq("id", testId);
+
+  if (updateError) {
+    console.error(updateError);
+  }
 }
 
 /* =========================================================
-   PUBLISH / END TEST
+   PUBLISH / END
 ========================================================= */
 
-async function publishTest(
-  chatId,
-  testId
-) {
-  const test =
-    await fetchTest(testId);
+async function publishTest(chatId, testId) {
+  const test = await getTest(testId);
 
   if (!test) {
-    return safeSend(
-      chatId,
-      "❌ Test not found."
-    );
+    await send(chatId, "❌ Test not found.");
+    return;
   }
 
-  if (!isDraft(test)) {
-    return safeSend(
-      chatId,
-      "🔒 Only draft tests can be published."
-    );
+  if (test.status !== "draft") {
+    await send(chatId, "❌ Only draft tests can be published.");
+    return;
   }
 
   if (!test.total_questions) {
-    return safeSend(
+    await send(
       chatId,
       "❌ Add at least one question before publishing."
     );
+    return;
   }
 
-  const {
-    data: subjects
-  } = await supabase
-    .from("test_subjects")
-    .select("subject_id")
-    .eq(
-      "test_id",
-      testId
-    );
-
-  if (
-    !subjects ||
-    !subjects.length
-  ) {
-    return safeSend(
-      chatId,
-      "❌ Select at least one subject before publishing."
-    );
-  }
-
-  const {
-    error
-  } = await supabase
+  const { error } = await supabase
     .from("tests")
     .update({
       status: "published",
-      updated_at:
-        new Date().toISOString()
+      updated_at: new Date().toISOString()
     })
-    .eq(
-      "id",
-      testId
-    );
+    .eq("id", testId)
+    .eq("status", "draft");
 
   if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
+    console.error(error);
+    await send(chatId, "❌ Could not publish test.");
+    return;
   }
 
-  await safeSend(
+  await send(
     chatId,
-    "🚀 Test published successfully."
-  );
+    `🚀 <b>Test Published</b>
 
-  await showTestDetail(
-    chatId,
-    testId
-  );
-}
+${escapeHtml(test.title)}
 
-async function endTest(
-  chatId,
-  testId
-) {
-  const test =
-    await fetchTest(testId);
-
-  if (!test) {
-    return safeSend(
-      chatId,
-      "❌ Test not found."
-    );
-  }
-
-  if (
-    test.status !==
-    "published"
-  ) {
-    return safeSend(
-      chatId,
-      "❌ Only published tests can be ended."
-    );
-  }
-
-  const {
-    error
-  } = await supabase
-    .from("tests")
-    .update({
-      status: "ended",
-      updated_at:
-        new Date().toISOString()
-    })
-    .eq(
-      "id",
-      testId
-    );
-
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
-  }
-
-  await safeSend(
-    chatId,
-    "⛔ Test ended."
-  );
-
-  await showTestDetail(
-    chatId,
-    testId
-  );
-}
-
-/* =========================================================
-   ANSWER KEY PLACEHOLDER
-========================================================= */
-
-async function answerKeyPlaceholder(
-  chatId,
-  testId
-) {
-  const test =
-    await fetchTest(testId);
-
-  if (!test) {
-    return safeSend(
-      chatId,
-      "❌ Test not found."
-    );
-  }
-
-  if (
-    test.status !==
-    "ended"
-  ) {
-    return safeSend(
-      chatId,
-      "🔒 Answer key upload is available after the test ends."
-    );
-  }
-
-  await safeSend(
-    chatId,
-`🔑 *Answer Key Upload*
-
-This module is reserved for the next phase.
-
-The database already supports multiple correct options through \`answer_key_options\`.
-
-No answer is collected during Question Builder.`,
+Questions: ${test.total_questions}
+Total Marks: ${test.total_marks}`,
     {
-      parse_mode: "Markdown"
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "📝 Test Details",
+              callback_data: `${PREFIX}test:${testId}`
+            }
+          ]
+        ]
+      }
     }
   );
 }
 
-/* =========================================================
-   RESULTS PLACEHOLDER
-========================================================= */
-
-async function resultsPlaceholder(
-  chatId,
-  testId
-) {
-  const test =
-    await fetchTest(testId);
+async function endTest(chatId, testId) {
+  const test = await getTest(testId);
 
   if (!test) {
-    return safeSend(
-      chatId,
-      "❌ Test not found."
-    );
+    await send(chatId, "❌ Test not found.");
+    return;
   }
 
-  await safeSend(
+  if (test.status !== "published") {
+    await send(chatId, "❌ Only published tests can be ended.");
+    return;
+  }
+
+  const { error } = await supabase
+    .from("tests")
+    .update({
+      status: "ended",
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", testId)
+    .eq("status", "published");
+
+  if (error) {
+    console.error(error);
+    await send(chatId, "❌ Could not end test.");
+    return;
+  }
+
+  await send(
     chatId,
-`📊 *Results*
+    `🔴 <b>Test Ended</b>
 
-${escapeMarkdown(test.title)}
+${escapeHtml(test.title)}
 
-Results/scoring module is reserved for the next phase.`,
+The test is now locked for editing.`,
     {
-      parse_mode: "Markdown"
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "📝 Test Details",
+              callback_data: `${PREFIX}test:${testId}`
+            }
+          ]
+        ]
+      }
     }
   );
 }
@@ -3391,1498 +2755,521 @@ Results/scoring module is reserved for the next phase.`,
    ADMIN MANAGEMENT
 ========================================================= */
 
-async function showAdmins(chatId) {
-  const me =
-    await getAdmin(chatId);
-
-  if (
-    !me ||
-    me.role !== "owner"
-  ) {
-    return safeSend(
+async function showAdmins(chatId, admin) {
+  if (admin.role !== "owner") {
+    await send(
       chatId,
-      "⛔ Only the owner can manage admins."
+      "⛔ Only the owner can manage admins.",
+      {
+        reply_markup: backKeyboard("panel")
+      }
     );
+    return;
   }
 
-  const {
-    data,
-    error
-  } = await supabase
+  const { data, error } = await supabase
     .from("telegram_admins")
-    .select(
-      "telegram_user_id,role,is_active,created_at"
-    )
+    .select("telegram_user_id, role, is_active, created_at")
     .order("created_at");
 
   if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
+    console.error(error);
+    await send(chatId, "❌ Could not load admins.");
+    return;
   }
 
-  const lines =
-    (data || [])
-      .map(
-        admin =>
-          `${admin.role === "owner" ? "👑" : "👤"} ${admin.telegram_user_id} — ${admin.role} — ${admin.is_active ? "active" : "inactive"}`
-      )
-      .join("\n");
+  let text = "👥 <b>Admins</b>\n\n";
 
-  const rows = [
-    [
-      {
-        text: "➕ Add Admin",
-        callback_data:
-          `${CALLBACK_PREFIX}na`
-      }
-    ]
-  ];
-
-  for (
-    const admin of
-    (data || []).filter(
-      item =>
-        item.role === "admin" &&
-        item.is_active
-    )
-  ) {
-    rows.push([
-      {
-        text:
-          `🔑 Set password ${admin.telegram_user_id}`,
-        callback_data:
-          `${CALLBACK_PREFIX}sap:${admin.telegram_user_id}`
-      },
-      {
-        text:
-          `🚫 Disable ${admin.telegram_user_id}`,
-        callback_data:
-          `${CALLBACK_PREFIX}da:${admin.telegram_user_id}`
-      }
-    ]);
+  for (const a of data || []) {
+    text += `${a.role === "owner" ? "👑" : "👤"} <code>${a.telegram_user_id}</code> — ${a.role} — ${
+      a.is_active ? "Active" : "Inactive"
+    }\n`;
   }
 
-  rows.push([
-    {
-      text: "⬅️ Panel",
-      callback_data:
-        `${CALLBACK_PREFIX}panel`
+  await send(chatId, text, {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "➕ Add Admin",
+            callback_data: `${PREFIX}addadmin`
+          }
+        ],
+        [
+          {
+            text: "🔑 Change Admin Password",
+            callback_data: `${PREFIX}changepass`
+          }
+        ],
+        [
+          {
+            text: "⬅️ Back",
+            callback_data: `${PREFIX}panel`
+          }
+        ]
+      ]
     }
-  ]);
+  });
+}
 
-  await safeSend(
+async function startAddAdmin(chatId) {
+  setSession(chatId, {
+    state: "admin_id"
+  });
+
+  await send(
     chatId,
-`👥 *Admins*
-
-${lines || "None"}`,
-    {
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: rows
-      }
-    }
+    "👤 Enter the new admin's Telegram numeric ID:"
   );
 }
 
-async function startAddAdmin(
-  chatId
-) {
-  const me =
-    await getAdmin(chatId);
+async function processAdminInput(msg) {
+  const chatId = msg.chat.id;
+  const session = getSession(chatId);
 
-  if (
-    !me ||
-    me.role !== "owner"
-  ) {
-    return safeSend(
-      chatId,
-      "⛔ Owner only."
-    );
-  }
+  if (!session) return false;
 
-  const session =
-    getSession(chatId);
+  if (session.state === "admin_id") {
+    const id = Number(msg.text.trim());
 
-  session.state =
-    "admin_id";
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      await send(chatId, "❌ Invalid Telegram ID.");
+      return true;
+    }
 
-  session.data = {};
-
-  session.authenticated =
-    true;
-
-  await safeSend(
-    chatId,
-    "Enter the new admin Telegram numeric ID:"
-  );
-}
-
-async function createAdmin(
-  chatId,
-  id,
-  password
-) {
-  if (
-    !/^\d+$/.test(
-      String(id)
-    )
-  ) {
-    return safeSend(
-      chatId,
-      "❌ Telegram ID must be numeric."
-    );
-  }
-
-  const numericId =
-    Number(id);
-
-  if (
-    !Number.isSafeInteger(
-      numericId
-    ) ||
-    numericId <= 0
-  ) {
-    return safeSend(
-      chatId,
-      "❌ Invalid Telegram ID."
-    );
-  }
-
-  if (
-    numericId ===
-    OWNER_TELEGRAM_ID
-  ) {
-    return safeSend(
-      chatId,
-      "❌ Owner ID cannot be added as admin."
-    );
-  }
-
-  if (
-    !password ||
-    password.length < 6
-  ) {
-    return safeSend(
-      chatId,
-      "❌ Password must be at least 6 characters."
-    );
-  }
-
-  const {
-    error
-  } = await supabase
-    .from("telegram_admins")
-    .upsert({
-      telegram_user_id:
-        numericId,
-      role: "admin",
-      password_hash:
-        hashPassword(password),
-      is_active: true,
-      updated_at:
-        new Date().toISOString()
+    setSession(chatId, {
+      state: "admin_password",
+      newAdminId: id
     });
 
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
+    await send(chatId, "Enter password for this admin:");
+    return true;
   }
 
-  resetSession(chatId);
+  if (session.state === "admin_password") {
+    const password = msg.text.trim();
 
-  getSession(chatId).authenticated =
-    true;
+    if (password.length < 6) {
+      await send(
+        chatId,
+        "❌ Password should be at least 6 characters."
+      );
+      return true;
+    }
 
-  await safeSend(
-    chatId,
-    "✅ Admin created/activated."
-  );
+    const { error } = await supabase
+      .from("telegram_admins")
+      .upsert({
+        telegram_user_id: session.newAdminId,
+        role: "admin",
+        password_hash: hashPassword(password),
+        is_active: true,
+        updated_at: new Date().toISOString()
+      });
 
-  await showAdmins(chatId);
-}
+    if (error) {
+      console.error(error);
+      await send(chatId, "❌ Could not create admin.");
+      return true;
+    }
 
-async function startSetAdminPassword(
-  chatId,
-  adminId
-) {
-  const me =
-    await getAdmin(chatId);
+    clearSession(chatId);
 
-  if (
-    !me ||
-    me.role !== "owner"
-  ) {
-    return safeSend(
+    await send(
       chatId,
-      "⛔ Owner only."
+      `✅ Admin <code>${session.newAdminId}</code> created successfully.`
     );
+
+    return true;
   }
 
-  const session =
-    getSession(chatId);
-
-  session.state =
-    "admin_password";
-
-  session.data = {
-    adminId:
-      Number(adminId)
-  };
-
-  session.authenticated =
-    true;
-
-  await safeSend(
-    chatId,
-    `Enter new password for admin ${adminId}:`
-  );
-}
-
-async function saveAdminPassword(
-  chatId,
-  password
-) {
-  const session =
-    getSession(chatId);
-
-  if (
-    !password ||
-    password.length < 6
-  ) {
-    return safeSend(
-      chatId,
-      "❌ Password must be at least 6 characters."
-    );
-  }
-
-  const {
-    error
-  } = await supabase
-    .from("telegram_admins")
-    .update({
-      password_hash:
-        hashPassword(password),
-      updated_at:
-        new Date().toISOString()
-    })
-    .eq(
-      "telegram_user_id",
-      session.data.adminId
-    )
-    .eq(
-      "role",
-      "admin"
-    );
-
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
-  }
-
-  resetSession(chatId);
-
-  getSession(chatId).authenticated =
-    true;
-
-  await safeSend(
-    chatId,
-    "✅ Admin password changed."
-  );
-
-  await showAdmins(chatId);
-}
-
-async function disableAdmin(
-  chatId,
-  adminId
-) {
-  const me =
-    await getAdmin(chatId);
-
-  if (
-    !me ||
-    me.role !== "owner"
-  ) {
-    return safeSend(
-      chatId,
-      "⛔ Owner only."
-    );
-  }
-
-  const {
-    error
-  } = await supabase
-    .from("telegram_admins")
-    .update({
-      is_active: false,
-      updated_at:
-        new Date().toISOString()
-    })
-    .eq(
-      "telegram_user_id",
-      Number(adminId)
-    )
-    .eq(
-      "role",
-      "admin"
-    );
-
-  if (error) {
-    return safeSend(
-      chatId,
-      `❌ ${error.message}`
-    );
-  }
-
-  await safeSend(
-    chatId,
-    "🚫 Admin disabled."
-  );
-
-  await showAdmins(chatId);
+  return false;
 }
 
 /* =========================================================
    CALLBACK ROUTER
 ========================================================= */
 
-async function handleCallback(query) {
-  const chatId =
-    query.message?.chat?.id;
+bot.on("callback_query", async query => {
+  const chatId = query.message.chat.id;
+  const data = query.data || "";
 
-  if (!chatId) {
-    return answerCallback(query);
-  }
+  await bot.answerCallbackQuery(query.id).catch(() => {});
 
-  const data =
-    String(query.data || "");
+  const admin = await requireCallbackAuth(query);
 
-  await answerCallback(query);
+  if (!admin) return;
 
-  if (
-    !data.startsWith(
-      CALLBACK_PREFIX
-    )
-  ) {
-    return;
-  }
+  if (!data.startsWith(PREFIX)) return;
 
-  const code =
-    data.slice(
-      CALLBACK_PREFIX.length
-    );
-
-  const session =
-    getSession(chatId);
-
-  /* -------------------------
-     LOGOUT
-  ------------------------- */
-
-  if (code === "logout") {
-    clearSession(chatId);
-
-    return safeSend(
-      chatId,
-      "🚪 Logged out. Use /start to authenticate again."
-    );
-  }
-
-  /* -------------------------
-     CANCEL
-  ------------------------- */
-
-  if (code === "cancel") {
-    resetSession(chatId);
-
-    getSession(chatId).authenticated =
-      true;
-
-    return safeSend(
-      chatId,
-      "❌ Cancelled."
-    );
-  }
-
-  /* -------------------------
-     HELP
-  ------------------------- */
-
-  if (code === "help") {
-    return showHelp(chatId);
-  }
-
-  /*
-    Internal callbacks are used while
-    an already-authenticated multi-step
-    operation is running.
-  */
-
-  const internal =
-    /^(qtype:|eqt:|tog:|vqp:|vqn:|del:|eqpick:|dqpick:|delpick:)/.test(
-      code
-    );
-
-  if (
-    !session.authenticated &&
-    !internal
-  ) {
-    return beginAuth(
-      chatId,
-      mapCallbackToAction(code)
-    );
-  }
-
-  if (
-    internal &&
-    !session.authenticated
-  ) {
-    return beginAuth(
-      chatId,
-      mapCallbackToAction(code)
-    );
-  }
+  const payload = data.slice(PREFIX.length);
 
   try {
-    if (code === "panel") {
-      return beginAuth(
-        chatId,
-        "panel"
-      );
+    if (payload === "panel") {
+      await showPanel(chatId);
+      return;
     }
 
-    if (code === "tests") {
-      return beginAuth(
-        chatId,
-        "tests"
-      );
+    if (payload === "help") {
+      await showHelp(chatId);
+      return;
     }
 
-    if (code === "subs") {
-      return beginAuth(
-        chatId,
-        "subs"
-      );
+    if (payload === "tests") {
+      await showTests(chatId);
+      return;
     }
 
-    if (code === "admins") {
-      return beginAuth(
-        chatId,
-        "admins"
-      );
+    if (payload === "subjects") {
+      await showSubjects(chatId);
+      return;
     }
 
-    if (code === "ct") {
-      return beginAuth(
-        chatId,
-        "create_test"
-      );
+    if (payload === "admins") {
+      await showAdmins(chatId, admin);
+      return;
     }
 
-    if (
-      code.startsWith("etm:")
-    ) {
-      return beginAuth(
-        chatId,
-        `edit_test:${code.slice(4)}`
-      );
+    if (payload === "create") {
+      await startCreateTest(chatId);
+      return;
     }
 
-    if (
-      code.startsWith("et:")
-    ) {
-      return beginAuth(
-        chatId,
-        `edit_test:${code.slice(3)}`
-      );
+    if (payload === "addsub") {
+      await startAddSubject(chatId);
+      return;
     }
 
-    if (
-      code.startsWith("ts:")
-    ) {
-      return beginAuth(
-        chatId,
-        `subjects:${code.slice(3)}`
-      );
+    if (payload.startsWith("subject:")) {
+      const subjectId = payload.split(":")[1];
+      await showSubject(chatId, subjectId);
+      return;
     }
 
-    if (
-      code.startsWith("qm:")
-    ) {
-      return beginAuth(
-        chatId,
-        `questions:${code.slice(3)}`
-      );
+    if (payload.startsWith("editsub:")) {
+      const subjectId = payload.split(":")[1];
+      await startEditSubject(chatId, subjectId);
+      return;
     }
 
-    if (
-      code.startsWith("aq:")
-    ) {
-      return beginAuth(
-        chatId,
-        `add_question:${code.slice(3)}`
-      );
+    if (payload.startsWith("togsub:")) {
+      const subjectId = payload.split(":")[1];
+
+      const { data: subject } = await supabase
+        .from("subjects")
+        .select("is_active")
+        .eq("id", subjectId)
+        .maybeSingle();
+
+      if (subject) {
+        await supabase
+          .from("subjects")
+          .update({
+            is_active: !subject.is_active
+          })
+          .eq("id", subjectId);
+      }
+
+      await showSubject(chatId, subjectId);
+      return;
     }
 
-    if (
-      code.startsWith("vq:")
-    ) {
-      return beginAuth(
-        chatId,
-        `view_questions:${code.slice(3)}`
-      );
+    if (payload.startsWith("test:")) {
+      const testId = payload.split(":")[1];
+      await showTestDetail(chatId, testId);
+      return;
     }
 
-    if (
-      code.startsWith("eqpick:")
-    ) {
-      return pickQuestion(
-        chatId,
-        code.slice(7),
-        "eqpick"
-      );
+    if (payload.startsWith("edit:")) {
+      const testId = payload.split(":")[1];
+      await showEditTestMenu(chatId, testId);
+      return;
     }
 
-    if (
-      code.startsWith("dqpick:")
-    ) {
-      return pickQuestion(
-        chatId,
-        code.slice(7),
-        "dqpick"
-      );
+    if (payload.startsWith("field:")) {
+      const [, field, testId] = payload.split(":");
+      await showFieldValue(chatId, testId, field);
+      return;
     }
 
-    if (
-      code.startsWith("pub:")
-    ) {
-      return beginAuth(
-        chatId,
-        `publish:${code.slice(4)}`
-      );
+    if (payload.startsWith("editfield:")) {
+      const [, field, testId] = payload.split(":");
+      await startEditField(chatId, testId, field);
+      return;
     }
 
-    if (
-      code.startsWith("end:")
-    ) {
-      return beginAuth(
-        chatId,
-        `end:${code.slice(4)}`
-      );
+    if (payload.startsWith("tsub:")) {
+      const testId = payload.split(":")[1];
+      await showTestSubjects(chatId, testId);
+      return;
     }
 
-    if (
-      code.startsWith("ak:")
-    ) {
-      return beginAuth(
-        chatId,
-        `answer_key:${code.slice(3)}`
-      );
-    }
+    if (payload.startsWith("togsubtest:")) {
+      const parts = payload.split(":");
 
-    if (
-      code.startsWith("rs:")
-    ) {
-      return beginAuth(
-        chatId,
-        `results:${code.slice(3)}`
-      );
-    }
+      const testId = parts[1];
+      const subjectId = parts[2];
 
-    if (code === "ns") {
-      return beginAuth(
-        chatId,
-        "new_subject"
-      );
-    }
-
-    if (
-      code.startsWith("es:")
-    ) {
-      return beginAuth(
-        chatId,
-        `edit_subject:${code.slice(3)}`
-      );
-    }
-
-    /* -------------------------
-       QUESTION TYPE
-    ------------------------- */
-
-    if (
-      code.startsWith("qtype:")
-    ) {
-      session.data.questionType =
-        code.slice(6);
-
-      session.state =
-        "question_text";
-
-      return safeSend(
-        chatId,
-        "Enter question text:"
-      );
-    }
-
-    /* -------------------------
-       QUESTION PAGINATION
-    ------------------------- */
-
-    if (
-      code.startsWith("vqp:")
-    ) {
-      const [
-        testId,
-        page
-      ] =
-        code
-          .slice(4)
-          .split(":");
-
-      return viewQuestions(
-        chatId,
-        testId,
-        Number(page)
-      );
-    }
-
-    if (
-      code.startsWith("vqn:")
-    ) {
-      const [
-        testId,
-        page
-      ] =
-        code
-          .slice(4)
-          .split(":");
-
-      return viewQuestions(
-        chatId,
-        testId,
-        Number(page)
-      );
-    }
-
-    /* -------------------------
-       DELETE
-    ------------------------- */
-
-    if (
-      code.startsWith("del:")
-    ) {
-      return deleteQuestion(
-        chatId,
-        code.slice(4)
-      );
-    }
-
-    /* -------------------------
-       SUBJECT TOGGLE
-    ------------------------- */
-
-    if (
-      code.startsWith("tog:")
-    ) {
-      const [
-        testId,
-        subjectId
-      ] =
-        code
-          .slice(4)
-          .split(":");
-
-      return toggleTestSubject(
+      await toggleTestSubject(
         chatId,
         testId,
         subjectId
       );
+
+      return;
     }
 
-    /* -------------------------
-       QUESTION PICK
-    ------------------------- */
+    /* QUESTIONS */
 
-    if (
-      code.startsWith("eqpick:")
-    ) {
-      return startEditQuestion(
+    if (payload.startsWith("questions:")) {
+      const testId = payload.split(":")[1];
+      await showQuestionMenu(chatId, testId);
+      return;
+    }
+
+    if (payload.startsWith("addq:")) {
+      const testId = payload.split(":")[1];
+      await startAddQuestion(chatId, testId);
+      return;
+    }
+
+    if (payload.startsWith("qtype:")) {
+      const type = payload.split(":")[1];
+      await chooseQuestionType(chatId, type);
+      return;
+    }
+
+    if (payload.startsWith("viewq:")) {
+      const parts = payload.split(":");
+      const testId = parts[1];
+      const page = Number(parts[2] || 0);
+
+      await viewQuestions(
         chatId,
-        code.slice(7)
+        testId,
+        Number.isInteger(page) ? page : 0
       );
+
+      return;
     }
 
-    if (
-      code.startsWith("dqpick:")
-    ) {
-      return pickQuestion(
-        chatId,
-        code.slice(7),
-        "delpick"
-      );
+    if (payload.startsWith("editqmenu:")) {
+      const testId = payload.split(":")[1];
+      await showEditQuestionMenu(chatId, testId);
+      return;
     }
 
-    if (
-      code.startsWith("delpick:")
-    ) {
-      return confirmDeleteQuestion(
-        chatId,
-        code.slice(8)
-      );
+    if (payload.startsWith("editoneq:")) {
+      const questionId = payload.split(":")[1];
+      await showEditQuestion(chatId, questionId);
+      return;
     }
 
-    /* -------------------------
-       QUESTION EDIT FIELD
-    ------------------------- */
-
-    if (
-      code.startsWith("eqf:")
-    ) {
-      const parts =
-        code.split(":");
-
-      const field =
-        parts[1];
-
-      const questionId =
-        parts[2];
-
-      return editQuestionField(
+    if (payload.startsWith("eqtext:")) {
+      const questionId = payload.split(":")[1];
+      await startQuestionEdit(
         chatId,
         questionId,
-        field
+        "text"
       );
+      return;
     }
 
-    /* -------------------------
-       QUESTION TYPE EDIT
-    ------------------------- */
-
-    if (
-      code.startsWith("eqt:")
-    ) {
-      const parts =
-        code.split(":");
-
-      const type =
-        parts[1];
-
-      const questionId =
-        parts[2];
-
-      return changeQuestionType(
+    if (payload.startsWith("eqmarks:")) {
+      const questionId = payload.split(":")[1];
+      await startQuestionEdit(
         chatId,
-        type,
-        questionId
+        questionId,
+        "marks"
       );
+      return;
     }
 
-    /* -------------------------
-       TEST FIELD EDIT
-    ------------------------- */
-
-    if (
-      code.startsWith("field:")
-    ) {
-      const parts =
-        code.split(":");
-
-      const field =
-        parts[1];
-
-      const testId =
-        parts[2];
-
-      session.state =
-        `edit_test_${field}`;
-
-      session.data = {
-        testId,
-        field
-      };
-
-      return safeSend(
+    if (payload.startsWith("eqneg:")) {
+      const questionId = payload.split(":")[1];
+      await startQuestionEdit(
         chatId,
-        `Enter new value for ${field}:`
+        questionId,
+        "neg"
       );
+      return;
     }
 
-    /* -------------------------
-       ADMIN
-    ------------------------- */
-
-    if (code === "na") {
-      return startAddAdmin(
-        chatId
-      );
+    if (payload.startsWith("eqopts:")) {
+      const questionId = payload.split(":")[1];
+      await showEditOptions(chatId, questionId);
+      return;
     }
 
-    if (
-      code.startsWith("sap:")
-    ) {
-      return startSetAdminPassword(
+    if (payload.startsWith("editopt:")) {
+      const optionId = payload.split(":")[1];
+      await startEditOption(chatId, optionId);
+      return;
+    }
+
+    if (payload.startsWith("delqmenu:")) {
+      const testId = payload.split(":")[1];
+      await showDeleteQuestionMenu(chatId, testId);
+      return;
+    }
+
+    if (payload.startsWith("confirmdel:")) {
+      const questionId = payload.split(":")[1];
+      await confirmDeleteQuestion(chatId, questionId);
+      return;
+    }
+
+    if (payload.startsWith("doDelete:")) {
+      const questionId = payload.split(":")[1];
+      await deleteQuestion(chatId, questionId);
+      return;
+    }
+
+    /* PUBLISH / END */
+
+    if (payload.startsWith("publish:")) {
+      const testId = payload.split(":")[1];
+      await publishTest(chatId, testId);
+      return;
+    }
+
+    if (payload.startsWith("end:")) {
+      const testId = payload.split(":")[1];
+      await endTest(chatId, testId);
+      return;
+    }
+
+    /* ADMINS */
+
+    if (payload === "addadmin") {
+      if (admin.role !== "owner") {
+        await send(chatId, "⛔ Owner only.");
+        return;
+      }
+
+      await startAddAdmin(chatId);
+      return;
+    }
+
+    if (payload === "changepass") {
+      await send(
         chatId,
-        code.slice(4)
+        "🔑 Password management will be handled from the admin management module."
       );
+      return;
     }
 
-    if (
-      code.startsWith("da:")
-    ) {
-      return disableAdmin(
-        chatId,
-        code.slice(3)
-      );
-    }
   } catch (error) {
-    console.error(
-      "callback error:",
-      error
-    );
+    console.error("Callback error:", error);
 
-    await safeSend(
+    await send(
       chatId,
-      "❌ Something went wrong. Try again."
+      "❌ Something went wrong while processing that action."
     );
   }
-}
+});
 
 /* =========================================================
-   CALLBACK -> AUTH ACTION
+   TEXT MESSAGE ROUTER
 ========================================================= */
 
-function mapCallbackToAction(
-  code
-) {
-  if (code === "tests") {
-    return "tests";
-  }
+bot.on("message", async msg => {
+  if (!msg.text) return;
 
-  if (code === "subs") {
-    return "subs";
-  }
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
 
-  if (code === "admins") {
-    return "admins";
-  }
-
-  if (code === "ct") {
-    return "create_test";
-  }
-
-  if (code === "ns") {
-    return "new_subject";
-  }
-
-  if (
-    code.startsWith("et:") ||
-    code.startsWith("etm:")
-  ) {
-    return `edit_test:${code
-      .split(":")
-      .slice(1)
-      .join(":")}`;
-  }
-
-  if (code.startsWith("ts:")) {
-    return `subjects:${code.slice(3)}`;
-  }
-
-  if (code.startsWith("qm:")) {
-    return `questions:${code.slice(3)}`;
-  }
-
-  if (code.startsWith("aq:")) {
-    return `add_question:${code.slice(3)}`;
-  }
-
-  if (code.startsWith("vq:")) {
-    return `view_questions:${code.slice(3)}`;
-  }
-
-  if (code.startsWith("eqpick:")) {
-    return `edit_question:${code.slice(7)}`;
-  }
-
-  if (code.startsWith("dqpick:")) {
-    return `delete_question:${code.slice(7)}`;
-  }
-
-  return "panel";
-}
-
-/* =========================================================
-   TEXT INPUT HANDLER
-========================================================= */
-
-async function handleText(msg) {
-  const chatId =
-    msg.chat.id;
-
-  const text =
-    String(msg.text || "")
-      .trim();
-
-  if (!text) {
+  if (text === "/start") {
+    await startLogin(chatId, msg.from.id);
     return;
   }
-
-  const session =
-    getSession(chatId);
-
-  /* -------------------------
-     CANCEL
-  ------------------------- */
 
   if (text === "/cancel") {
-    resetSession(chatId);
+    clearSession(chatId);
 
-    return safeSend(
+    await send(
       chatId,
-      "❌ Cancelled. Use /start to authenticate again."
+      "❌ Current operation cancelled."
     );
-  }
 
-  if (
-    text.startsWith("/")
-  ) {
     return;
   }
 
-  /* -------------------------
-     PASSWORD
-  ------------------------- */
+  if (text === "/help") {
+    const admin = await requireAuth(msg);
 
-  if (
-    session.state ===
-    "await_password"
-  ) {
-    const admin =
-      await getAdmin(
-        msg.from.id
-      );
-
-    if (
-      !admin ||
-      !admin.is_active
-    ) {
-      return safeSend(
-        chatId,
-        "⛔ You are not authorized."
-      );
+    if (admin) {
+      await showHelp(chatId);
     }
 
-    if (
-      !verifyPassword(
-        text,
-        admin.password_hash
-      )
-    ) {
-      return safeSend(
-        chatId,
-        "❌ Wrong password. Try again."
-      );
-    }
-
-    session.authenticated =
-      true;
-
-    session.state =
-      "idle";
-
-    const action =
-      session.authAction;
-
-    session.authAction =
-      null;
-
-    return runAuthenticatedAction(
-      chatId,
-      action
-    );
+    return;
   }
 
-  /* -------------------------
-     AUTH REQUIRED
-  ------------------------- */
+  const session = getSession(chatId);
 
-  if (!session.authenticated) {
-    return safeSend(
-      chatId,
-      "🔐 Use /start to authenticate."
-    );
+  if (!session) {
+    await startLogin(chatId, msg.from.id);
+    return;
+  }
+
+  if (
+    session.state === "password"
+  ) {
+    await processPassword(msg);
+    return;
+  }
+
+  if (!session.loggedIn) {
+    await startLogin(chatId, msg.from.id);
+    return;
   }
 
   try {
-    /* =====================================================
-       CREATE TEST
-    ===================================================== */
+    if (await processCreateTest(msg)) return;
 
-    if (
-      session.state.startsWith(
-        "create_"
-      )
-    ) {
-      if (
-        session.state ===
-        "create_title"
-      ) {
-        session.data.title =
-          text;
+    if (await processEditField(msg)) return;
 
-        session.state =
-          "create_description";
+    if (await processEditNegativeValue(msg)) return;
 
-        return safeSend(
-          chatId,
-          "Enter description (or type - to skip):"
-        );
-      }
+    if (await processSubjectInput(msg)) return;
 
-      if (
-        session.state ===
-        "create_description"
-      ) {
-        session.data.description =
-          text === "-"
-            ? ""
-            : text;
+    if (await processQuestionBuilder(msg)) return;
 
-        session.state =
-          "create_date";
+    if (await processQuestionEdit(msg)) return;
 
-        return safeSend(
-          chatId,
-          "Enter test date YYYY-MM-DD (or - to skip):"
-        );
-      }
+    if (await processEditOption(msg)) return;
 
-      if (
-        session.state ===
-        "create_date"
-      ) {
-        session.data.testDate =
-          text === "-"
-            ? ""
-            : text;
+    if (await processAdminInput(msg)) return;
 
-        session.state =
-          "create_time";
-
-        return safeSend(
-          chatId,
-          "Enter test time HH:MM (or - to skip):"
-        );
-      }
-
-      if (
-        session.state ===
-        "create_time"
-      ) {
-        session.data.testTime =
-          text === "-"
-            ? ""
-            : text;
-
-        session.state =
-          "create_duration";
-
-        return safeSend(
-          chatId,
-          "Enter duration in minutes:"
-        );
-      }
-
-      if (
-        session.state ===
-        "create_duration"
-      ) {
-        const number =
-          Number(text);
-
-        if (
-          !Number.isInteger(
-            number
-          ) ||
-          number <= 0
-        ) {
-          return safeSend(
-            chatId,
-            "❌ Enter a positive integer."
-          );
-        }
-
-        session.data.duration =
-          number;
-
-        session.state =
-          "create_marks";
-
-        return safeSend(
-          chatId,
-          "Enter default marks per question:"
-        );
-      }
-
-      if (
-        session.state ===
-        "create_marks"
-      ) {
-        const number =
-          Number(text);
-
-        if (!(number > 0)) {
-          return safeSend(
-            chatId,
-            "❌ Marks must be positive."
-          );
-        }
-
-        session.data.marksPerQuestion =
-          number;
-
-        session.state =
-          "create_negative_enabled";
-
-        return safeSend(
-          chatId,
-          "Enable negative marking? yes/no"
-        );
-      }
-
-      if (
-        session.state ===
-        "create_negative_enabled"
-      ) {
-        const value =
-          text.toLowerCase();
-
-        if (
-          value !== "yes" &&
-          value !== "no"
-        ) {
-          return safeSend(
-            chatId,
-            "❌ Type yes or no."
-          );
-        }
-
-        session.data.negativeEnabled =
-          value === "yes";
-
-        session.state =
-          "create_negative_value";
-
-        return safeSend(
-          chatId,
-          "Enter negative marks (0 or positive number):"
-        );
-      }
-
-      if (
-        session.state ===
-        "create_negative_value"
-      ) {
-        const number =
-          Number(text);
-
-        if (!(number >= 0)) {
-          return safeSend(
-            chatId,
-            "❌ Invalid negative marks."
-          );
-        }
-
-        session.data.negativeValue =
-          number;
-
-        session.state =
-          "create_instructions";
-
-        return safeSend(
-          chatId,
-          "Enter instructions (or - to skip):"
-        );
-      }
-
-      if (
-        session.state ===
-        "create_instructions"
-      ) {
-        session.data.instructions =
-          text === "-"
-            ? ""
-            : text;
-
-        return createTestFromSession(
-          chatId
-        );
-      }
-    }
-
-    /* =====================================================
-       EDIT TEST
-    ===================================================== */
-
-    if (
-      session.state.startsWith(
-        "edit_test_"
-      )
-    ) {
-      return saveTestField(
-        chatId,
-        session.data.testId,
-        session.data.field,
-        text
-      );
-    }
-
-    /* =====================================================
-       SUBJECT
-    ===================================================== */
-
-    if (
-      session.state ===
-      "subject_new"
-    ) {
-      return saveNewSubject(
-        chatId,
-        text
-      );
-    }
-
-    if (
-      session.state ===
-      "subject_edit"
-    ) {
-      return saveEditedSubject(
-        chatId,
-        session.data.subjectId,
-        text
-      );
-    }
-
-    /* =====================================================
-       ADD QUESTION
-    ===================================================== */
-
-    const questionStates = [
-      "question_text",
-      "option_a",
-      "option_b",
-      "option_c",
-      "option_d",
-      "question_marks",
-      "question_negative"
-    ];
-
-    if (
-      questionStates.includes(
-        session.state
-      )
-    ) {
-      return processQuestionInput(
-        chatId,
-        text
-      );
-    }
-
-    /* =====================================================
-       EDIT QUESTION
-    ===================================================== */
-
-    const editQuestionStates = [
-      "edit_text",
-      "edit_marks",
-      "edit_neg",
-      "edit_option_a",
-      "edit_option_b",
-      "edit_option_c",
-      "edit_option_d"
-    ];
-
-    if (
-      editQuestionStates.includes(
-        session.state
-      )
-    ) {
-      return processEditInput(
-        chatId,
-        text
-      );
-    }
-
-    /* =====================================================
-       ADMIN CREATION
-    ===================================================== */
-
-    if (
-      session.state ===
-      "admin_id"
-    ) {
-      if (
-        !/^\d+$/.test(text)
-      ) {
-        return safeSend(
-          chatId,
-          "❌ Enter numeric Telegram ID."
-        );
-      }
-
-      session.data.adminId =
-        Number(text);
-
-      session.state =
-        "admin_password";
-
-      return safeSend(
-        chatId,
-        "Enter password for this admin (minimum 6 characters):"
-      );
-    }
-
-    if (
-      session.state ===
-      "admin_password"
-    ) {
-      if (
-        session.data.adminId
-      ) {
-        return createAdmin(
-          chatId,
-          session.data.adminId,
-          text
-        );
-      }
-
-      return saveAdminPassword(
-        chatId,
-        text
-      );
-    }
-
-    return safeSend(
+    await send(
       chatId,
-      "Use the buttons or /start."
+      "Use the buttons below to continue.",
+      {
+        reply_markup: mainKeyboard()
+      }
     );
   } catch (error) {
-    console.error(
-      "text error:",
-      error
-    );
+    console.error("Message handler error:", error);
 
-    return safeSend(
+    await send(
       chatId,
-      "❌ Something went wrong."
+      "❌ Something went wrong. Use /cancel and try again."
     );
   }
-}
+});
 
 /* =========================================================
    COMMANDS
 ========================================================= */
 
-bot.onText(
-  /^\/start$/,
-  async msg => {
-    await showAdminGate(
-      msg.chat.id
-    );
-  }
-);
+bot.onText(/^\/cancel$/, async msg => {
+  clearSession(msg.chat.id);
 
-bot.onText(
-  /^\/help$/,
-  async msg => {
-    const admin =
-      await getAdmin(
-        msg.from.id
-      );
-
-    if (
-      !admin ||
-      !admin.is_active
-    ) {
-      return safeSend(
-        msg.chat.id,
-        "⛔ Admin access required. Use /start."
-      );
-    }
-
-    await beginAuth(
-      msg.chat.id,
-      "panel"
-    );
-  }
-);
-
-bot.onText(
-  /^\/cancel$/,
-  async msg => {
-    resetSession(
-      msg.chat.id
-    );
-
-    await safeSend(
-      msg.chat.id,
-      "❌ Cancelled."
-    );
-  }
-);
-
-/* =========================================================
-   BOT EVENTS
-========================================================= */
-
-bot.on(
-  "callback_query",
-  handleCallback
-);
-
-bot.on(
-  "message",
-  handleText
-);
-
-bot.on(
-  "polling_error",
-  error => {
-    console.error(
-      "Telegram polling error:",
-      error.message
-    );
-  }
-);
-
-/* =========================================================
-   PROCESS ERROR HANDLERS
-========================================================= */
-
-process.on(
-  "unhandledRejection",
-  error => {
-    console.error(
-      "Unhandled rejection:",
-      error
-    );
-  }
-);
-
-process.on(
-  "uncaughtException",
-  error => {
-    console.error(
-      "Uncaught exception:",
-      error
-    );
-  }
-);
+  await send(
+    msg.chat.id,
+    "❌ Current operation cancelled."
+  );
+});
 
 /* =========================================================
    STARTUP
@@ -4892,15 +3279,20 @@ process.on(
   try {
     await ensureOwnerAccount();
 
-    console.log(
-      "🤖 PrepArena Admin Bot is running..."
-    );
+    console.log("=================================");
+    console.log("PrepArena Admin Bot started");
+    console.log("Polling mode: ON");
+    console.log("=================================");
   } catch (error) {
-    console.error(
-      "Startup failed:",
-      error
-    );
-
+    console.error("Startup error:", error);
     process.exit(1);
   }
 })();
+
+process.on("unhandledRejection", error => {
+  console.error("Unhandled rejection:", error);
+});
+
+process.on("uncaughtException", error => {
+  console.error("Uncaught exception:", error);
+});
