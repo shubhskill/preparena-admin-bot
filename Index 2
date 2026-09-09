@@ -1,0 +1,135 @@
+// ============================================
+// PrepArena Admin Bot — Dismiss Admin Edit
+// ============================================
+
+// 1. REPLACE your existing showManageAdminList()
+//    function with this function.
+
+async function showManageAdminList(chatId) {
+  const { data, error } = await supabase
+    .from("telegram_admins")
+    .select("telegram_user_id, role, is_active")
+    .eq("role", "admin")
+    .order("telegram_user_id", { ascending: true });
+
+  if (error) {
+    console.error("showManageAdminList error:", error);
+    await send(chatId, "❌ Could not load admins.");
+    return;
+  }
+
+  const rows = [];
+
+  for (const admin of data || []) {
+    // Admin profile/details button
+    rows.push([
+      {
+        text: `${admin.is_active ? "🟢" : "⚪"} ${admin.telegram_user_id}`,
+        callback_data: `${PREFIX}manageadmin:${admin.telegram_user_id}`
+      }
+    ]);
+
+    // Direct dismiss button
+    rows.push([
+      {
+        text: "🗑️ Dismiss Admin",
+        callback_data: `${PREFIX}admindismiss:${admin.telegram_user_id}`
+      }
+    ]);
+  }
+
+  rows.push([
+    {
+      text: "⬅️ Back",
+      callback_data: `${PREFIX}admins`
+    }
+  ]);
+
+  await send(
+    chatId,
+    data && data.length
+      ? "⚙️ <b>Manage Admins</b>\n\nSelect an admin:"
+      : "⚙️ <b>Manage Admins</b>\n\nNo admin accounts found.",
+    {
+      reply_markup: {
+        inline_keyboard: rows
+      }
+    }
+  );
+}
+
+
+// ============================================
+// 2. ADD THIS CALLBACK HANDLER
+// ============================================
+//
+// Put this inside your existing callback_query
+// / callback payload handling section.
+//
+// IMPORTANT:
+// It should be checked BEFORE the generic
+// manageadmin: / adminremove: handlers if possible.
+
+if (payload.startsWith("admindismiss:")) {
+  if (!isOwner(admin)) {
+    await send(chatId, "⛔ Owner only.");
+    return;
+  }
+
+  const targetId = Number(payload.split(":")[1]);
+
+  if (!Number.isInteger(targetId)) {
+    await send(chatId, "❌ Invalid admin ID.");
+    return;
+  }
+
+  const { data: target, error: targetError } = await supabase
+    .from("telegram_admins")
+    .select("telegram_user_id, role")
+    .eq("telegram_user_id", targetId)
+    .maybeSingle();
+
+  if (targetError) {
+    console.error("admindismiss lookup error:", targetError);
+    await send(chatId, "❌ Could not find this admin.");
+    return;
+  }
+
+  if (!target) {
+    await send(chatId, "❌ Admin not found.");
+    return;
+  }
+
+  // Never allow owner account to be dismissed
+  if (target.role === "owner") {
+    await send(chatId, "⛔ Owner cannot be dismissed.");
+    return;
+  }
+
+  await send(
+    chatId,
+    `⚠️ <b>Dismiss Admin?</b>\n\n` +
+      `Are you sure you want to remove admin ` +
+      `<code>${target.telegram_user_id}</code>?`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "✅ Yes, Dismiss",
+              callback_data: `${PREFIX}adminremove:${targetId}`
+            }
+          ],
+          [
+            {
+              text: "❌ Cancel",
+              callback_data: `${PREFIX}manageadmins`
+            }
+          ]
+        ]
+      }
+    }
+  );
+
+  return;
+}
