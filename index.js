@@ -9,7 +9,7 @@ const crypto = require("crypto");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
-const OWNER_PASSWORD = process.env.OWNER_PASSWORD;
+const OWNER_PASSWORD = String(process.env.OWNER_PASSWORD || "").trim();
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN is missing");
 if (!SUPABASE_URL) throw new Error("SUPABASE_URL is missing");
@@ -242,22 +242,19 @@ async function ensureOwnerAccount() {
     return;
   }
 
-  if (
-    data.role !== "owner" ||
-    data.is_active !== true
-  ) {
-    const { error: updateError } = await supabase
-      .from("telegram_admins")
-      .update({
-        role: "owner",
-        is_active: true,
-        updated_at: new Date().toISOString()
-      })
-      .eq("telegram_user_id", OWNER_TELEGRAM_ID);
+  // Keep the owner record synchronized with Railway's OWNER_PASSWORD.
+  const { error: updateError } = await supabase
+    .from("telegram_admins")
+    .update({
+      role: "owner",
+      is_active: true,
+      password_hash: hashPassword(OWNER_PASSWORD),
+      updated_at: new Date().toISOString()
+    })
+    .eq("telegram_user_id", OWNER_TELEGRAM_ID);
 
-    if (updateError) {
-      console.error("Owner update error:", updateError);
-    }
+  if (updateError) {
+    console.error("Owner update error:", updateError);
   }
 }
 
@@ -379,7 +376,13 @@ async function processPassword(msg) {
     return true;
   }
 
-  if (!verifyPassword(msg.text.trim(), admin.password_hash)) {
+  const enteredPassword = msg.text.trim();
+  const passwordValid =
+    admin.role === "owner"
+      ? enteredPassword === OWNER_PASSWORD
+      : verifyPassword(enteredPassword, admin.password_hash);
+
+  if (!passwordValid) {
     await send(
       chatId,
       "❌ Incorrect password.\n\nTry again or use /cancel."
