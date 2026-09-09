@@ -98,28 +98,6 @@ function isValidTime(value) {
   return h >= 0 && h <= 23 && m >= 0 && m <= 59;
 }
 
-async function getApplicationOwnerId() {
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id")
-    .eq("role", "owner")
-    .limit(2);
-
-  if (error) {
-    throw new Error(`Could not find application owner: ${error.message}`);
-  }
-
-  if (!data || data.length !== 1) {
-    throw new Error(
-      data?.length
-        ? "There must be exactly one application owner before creating tests."
-        : "No application owner exists. Set your PrepArena application account as owner first."
-    );
-  }
-
-  return data[0].id;
-}
-
 async function requireAuthenticatedSession(chatId, userId) {
   if (sessionIsAuthenticated(chatId, userId)) return true;
 
@@ -723,16 +701,7 @@ async function processCreateTest(msg) {
     return true;
   }
 
-  let ownerId;
-  try {
-    ownerId = await getApplicationOwnerId();
-  } catch (ownerError) {
-    await send(chatId, `❌ ${escapeHtml(ownerError.message)}`);
-    return true;
-  }
-
   const draft = {
-    owner_id: ownerId,
     title,
     description: null,
     status: "draft",
